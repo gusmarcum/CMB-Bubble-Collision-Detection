@@ -1,0 +1,24 @@
+# Data files (large FITS maps, don't commit)
+data/*.fits
+data/*.fits.gz
+
+# Plots are committed to repo for README display
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
