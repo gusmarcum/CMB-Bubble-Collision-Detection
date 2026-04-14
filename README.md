@@ -123,8 +123,8 @@ python scripts/phase2_signal_model.py
 
 ## Key References
 
-- Feeney, Johnson, Mortlock & Peiris (2011). *First Observational Tests of Eternal Inflation.* [arXiv:1012.3667](https://arxiv.org/abs/1012.3667)
-- Feeney, Johnson, Mortlock & Peiris (2011). *First Observational Tests of Eternal Inflation: Analysis Methods and WMAP 7-Year Results.* [arXiv:1012.1995](https://arxiv.org/abs/1012.1995)
+- Feeney, Johnson, Mortlock & Peiris (2011). *First Observational Tests of Eternal Inflation: Analysis Methods and WMAP 7-Year Results.* [arXiv:1012.3667](https://arxiv.org/abs/1012.3667)
+- Feeney, Johnson, Mortlock & Peiris (2011). *First Observational Tests of Eternal Inflation* [arXiv:1012.1995](https://arxiv.org/abs/1012.1995)
 - Zhang et al. (2024). *CMBubbles: Bubble Collision Detection in the CMB.*
 - Górski et al. (2005). *HEALPix: A Framework for High-Resolution Discretization and Fast Analysis of Data Distributed on the Sphere.*
 
