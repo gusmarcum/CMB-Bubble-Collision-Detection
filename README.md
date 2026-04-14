@@ -41,7 +41,7 @@ Downloaded the Planck 2018 SMICA cleaned CMB map, loaded and visualized HEALPix 
 
 ![Gnomonic patch near Cold Spot](plots/04_gnomonic_cold_spot.png)
 
-### Phase 2: Synthetic Data Generator — ✅ V1 Complete
+### Phase 2: Synthetic Data Generator — Near Complete
 
 Implemented the bubble collision signal model from Feeney et al. (2011) Eq. 1 and verified the multiplicative injection step against Feeney et al. (2011) Eq. 15. The generator now builds training data directly from real Planck SMICA sky patches, using random unmasked sky locations, centered synthetic injections, binary segmentation masks, and saved metadata for each sample.
 
@@ -65,7 +65,7 @@ This preview was generated from the actual training pipeline after checking that
 
 ![Phase 2 training sample collage](plots/09_training_samples.png)
 
-Phase 2 V1 delivered:
+Phase 2 checklist:
 - [x] Reused the Planck SMICA + galactic mask loading flow from Phase 1
 - [x] Built a valid coordinate pool from unmasked sky locations
 - [x] Generated balanced positive and negative 256×256 training patches
@@ -73,7 +73,7 @@ Phase 2 V1 delivered:
 - [x] Saved patches, labels, binary masks, and injection parameters to HDF5
 - [x] Ran a 1000-sample visual verification pass and a 10000-sample production run locally
 
-Still to do after Phase 2 V1:
+Still to do:
 - [ ] Generate CMB realizations using CAMB (or work with Planck noise maps)
 - [ ] Validate injection statistics across parameter ranges
 
