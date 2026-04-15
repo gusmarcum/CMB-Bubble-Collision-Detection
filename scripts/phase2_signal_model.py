@@ -30,6 +30,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
+from scipy.special import erf
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
@@ -41,7 +42,24 @@ PATCH_PIX = 256
 T_CMB_K = 2.7255
 
 
-def bubble_collision_signal(theta, z0, zcrit, theta_crit):
+def causal_boundary_window(theta, theta_crit, edge_sigma_deg=0.0):
+    """
+    Return a hard or softly smeared causal boundary window.
+
+    For edge_sigma_deg = 0, this reduces to the sharp Heaviside step used in
+    Feeney et al. (2011). For edge_sigma_deg > 0, we smooth the boundary with
+    a Gaussian CDF transition of width sigma to make the training set more
+    robust to sub-degree edge smearing.
+    """
+    if edge_sigma_deg <= 0.0:
+        return (theta <= theta_crit).astype(float)
+
+    edge_sigma = np.radians(edge_sigma_deg)
+    scaled = (theta_crit - theta) / (np.sqrt(2.0) * edge_sigma)
+    return 0.5 * (1.0 + erf(scaled))
+
+
+def bubble_collision_signal(theta, z0, zcrit, theta_crit, edge_sigma_deg=0.0):
     """
     Feeney et al. (2011) Eq. 1: temperature modulation from a bubble collision.
 
@@ -56,6 +74,10 @@ def bubble_collision_signal(theta, z0, zcrit, theta_crit):
     theta_crit : float
         Angular radius of the collision disk (radians).
 
+    edge_sigma_deg : float, optional
+        Width of Gaussian edge smearing in degrees. A value of 0 uses the
+        original sharp causal boundary.
+
     Returns
     -------
     signal : ndarray
@@ -65,8 +87,8 @@ def bubble_collision_signal(theta, z0, zcrit, theta_crit):
     intercept = (zcrit - z0 * np.cos(theta_crit)) / denom
     slope = (z0 - zcrit) / denom
     modulation = intercept + slope * np.cos(theta)
-    mask = (theta <= theta_crit).astype(float)
-    return modulation * mask
+    window = causal_boundary_window(theta, theta_crit, edge_sigma_deg=edge_sigma_deg)
+    return modulation * window
 
 
 def make_angular_distance_grid(npix, reso_arcmin):
@@ -85,7 +107,7 @@ def make_angular_distance_grid(npix, reso_arcmin):
     return np.arctan(r_plane)
 
 
-def inject_signal_into_patch(patch, z0, zcrit, theta_crit_deg):
+def inject_signal_into_patch(patch, z0, zcrit, theta_crit_deg, edge_sigma_deg=0.0):
     """
     Inject a bubble collision signal centered on a flat-sky patch.
     
@@ -97,7 +119,13 @@ def inject_signal_into_patch(patch, z0, zcrit, theta_crit_deg):
     """
     theta_grid = make_angular_distance_grid(patch.shape[0], RESO_ARCMIN)
     theta_crit = np.radians(theta_crit_deg)
-    signal = bubble_collision_signal(theta_grid, z0, zcrit, theta_crit)
+    signal = bubble_collision_signal(
+        theta_grid,
+        z0,
+        zcrit,
+        theta_crit,
+        edge_sigma_deg=edge_sigma_deg,
+    )
     injected = (1.0 + signal) * (T_CMB_K + patch) - T_CMB_K
     return injected, signal
 

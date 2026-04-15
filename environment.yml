@@ -7,5 +7,7 @@ dependencies:
   - healpy
   - h5py
   - numpy
+  - scipy
   - matplotlib
   - astropy
+  - camb

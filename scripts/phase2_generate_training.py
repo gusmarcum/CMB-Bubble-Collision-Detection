@@ -1,17 +1,21 @@
 """
-Phase 2 V1: Generate inspectable training data from real Planck SMICA patches.
+Phase 2 V2: Generate training data for bubble-collision detection.
 
-This script reuses the Phase 1 data-loading flow and the Phase 2 multiplicative
-signal injection code to build a simple training set:
-    - 50% clean negative patches
-    - 50% positive patches with a centered bubble-collision injection
+The training set is built from CAMB realizations, not from the single real SMICA
+sky. This matters because the model should learn the bubble-collision pattern on
+top of generic CMB fluctuations, not overfit to one particular realization of
+the sky. The real Planck mask is still used to choose clean sky coordinates so
+the patch geometry matches the final inference setup on SMICA.
 
-Outputs are saved as an HDF5 file plus quick-look preview PNGs so the first run
-can be sanity-checked before scaling up.
+Physics choices:
+    - Feeney et al. (2011) Eq. 1 for the radial collision template
+    - Feeney et al. (2011) Eq. 15 for multiplicative injection
+    - Feeney et al. (2011) Eq. 2 motivation for a sin(theta_crit) size prior
+    - always-on edge smoothing to reflect the paper's discussion that the
+      causal boundary may be smeared on sub-degree scales
 
-Usage (from project root, with cmb conda env activated):
-    python scripts/phase2_generate_training.py
-    python scripts/phase2_generate_training.py --num-samples 20 --pool-size 200
+Outputs are saved as an HDF5 file plus validation plots so the dataset can be
+checked before moving on to model training.
 """
 
 import argparse
@@ -27,23 +31,24 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from phase1_explore import DATA_DIR, MASK_FILE, MASK_URL, SMICA_FILE, SMICA_URL, download_file
+from phase1_explore import DATA_DIR, MASK_FILE, MASK_URL, download_file
 from phase2_signal_model import (
     PATCH_PIX,
     RESO_ARCMIN,
+    bubble_collision_signal,
     inject_signal_into_patch,
     make_angular_distance_grid,
 )
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_OUTPUT_DIR = os.path.join(DATA_DIR, "training_v1")
+DEFAULT_OUTPUT_DIR = os.path.join(DATA_DIR, "training_v2")
 NSIDE_WORKING = 256
 MASK_THRESHOLD = 0.95
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate a simple SMICA-based training dataset for bubble-collision segmentation.",
+        description="Generate a CAMB-based training dataset for bubble-collision segmentation.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--num-samples", type=int, default=1000)
@@ -51,6 +56,9 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--pool-size", type=int, default=5000)
     parser.add_argument("--preview-count", type=int, default=8)
+    parser.add_argument("--num-cmb-realizations", type=int, default=192)
+    parser.add_argument("--edge-sigma-min-deg", type=float, default=0.3)
+    parser.add_argument("--edge-sigma-max-deg", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -61,27 +69,104 @@ def ensure_even_sample_count(num_samples):
         raise ValueError("--num-samples must be even so the dataset is exactly 50/50 positive and negative.")
 
 
+def validate_smoothing_args(args):
+    if args.num_cmb_realizations <= 0:
+        raise ValueError("--num-cmb-realizations must be positive.")
+    if args.edge_sigma_min_deg < 0.0 or args.edge_sigma_max_deg < 0.0:
+        raise ValueError("--edge sigma bounds must be non-negative.")
+    if args.edge_sigma_min_deg > args.edge_sigma_max_deg:
+        raise ValueError("--edge-sigma-min-deg must be <= --edge-sigma-max-deg.")
+
+
 def ensure_planck_inputs():
     os.makedirs(DATA_DIR, exist_ok=True)
-    download_file(SMICA_URL, SMICA_FILE)
     download_file(MASK_URL, MASK_FILE)
 
 
-def load_smica_and_mask():
-    print("\n=== Loading Planck inputs ===")
+def load_mask():
+    print("\n=== Loading galactic mask ===")
     ensure_planck_inputs()
-
-    smica = hp.read_map(SMICA_FILE, field=0, verbose=False)
-    smica_256 = hp.ud_grade(smica, NSIDE_WORKING)
 
     mask = hp.read_map(MASK_FILE, field=0, verbose=False)
     mask_256 = hp.ud_grade(mask, NSIDE_WORKING)
     mask_256 = np.where(mask_256 > 0.5, 1.0, 0.0)
 
     sky_fraction = float(np.mean(mask_256))
-    print(f"  SMICA degraded to Nside={NSIDE_WORKING}")
     print(f"  Mask sky fraction: {sky_fraction:.1%}")
-    return smica_256, mask_256, sky_fraction
+    return mask_256, sky_fraction
+
+
+def planck2018_bestfit_params():
+    """
+    Planck 2018 base-LambdaCDM best-fit values used for CAMB realizations.
+
+    Values correspond to the standard Planck 2018 TT,TE,EE+lowE+lensing fit:
+        ombh2 = 0.02237
+        omch2 = 0.1200
+        H0 = 67.36
+        tau = 0.0544
+        ns = 0.9649
+        ln(1e10 As) = 3.044
+    """
+    return {
+        "H0": 67.36,
+        "ombh2": 0.02237,
+        "omch2": 0.1200,
+        "tau": 0.0544,
+        "ns": 0.9649,
+        "As": math.exp(3.044) / 1e10,
+    }
+
+
+def generate_camb_realizations(num_realizations, rng):
+    print("\n=== Generating CAMB realizations ===")
+    try:
+        import camb
+    except ImportError as exc:
+        raise RuntimeError(
+            "CAMB is required for Phase 2 V2. Install it in the active environment "
+            "before running this script."
+        ) from exc
+
+    params = planck2018_bestfit_params()
+    lmax = 3 * NSIDE_WORKING - 1
+
+    pars = camb.CAMBparams()
+    pars.set_cosmology(
+        H0=params["H0"],
+        ombh2=params["ombh2"],
+        omch2=params["omch2"],
+        tau=params["tau"],
+    )
+    pars.InitPower.set_params(As=params["As"], ns=params["ns"])
+    pars.set_for_lmax(lmax, lens_potential_accuracy=0)
+
+    results = camb.get_results(pars)
+    # synfast expects raw C_ell, not D_ell = l(l+1)C_ell/2pi.
+    cls_tt = results.get_cmb_power_spectra(
+        pars,
+        CMB_unit="K",
+        raw_cl=True,
+    )["lensed_scalar"][:, 0]
+    cls_tt = cls_tt[: lmax + 1]
+
+    realizations = np.empty((num_realizations, hp.nside2npix(NSIDE_WORKING)), dtype=np.float32)
+    seeds = rng.integers(0, 2**32 - 1, size=num_realizations, dtype=np.uint32)
+
+    for idx, seed_i in enumerate(seeds):
+        np.random.seed(int(seed_i))
+        realizations[idx] = hp.synfast(
+            cls_tt,
+            NSIDE_WORKING,
+            lmax=lmax,
+            new=True,
+            pixwin=False,
+            verbose=False,
+        ).astype(np.float32)
+        if (idx + 1) % 16 == 0 or idx + 1 == num_realizations:
+            print(f"  Generated {idx + 1:4d} / {num_realizations} CAMB skies")
+
+    return realizations, params
 
 
 def sample_random_galactic_coordinate(rng):
@@ -152,6 +237,31 @@ def sample_log_uniform(rng, low, high):
     return float(10.0 ** log_value)
 
 
+def sample_theta_crit_from_sin_prior(rng, low_deg=5.0, high_deg=25.0):
+    low_rad = np.radians(low_deg)
+    high_rad = np.radians(high_deg)
+    u = rng.uniform()
+    cos_theta = np.cos(low_rad) - u * (np.cos(low_rad) - np.cos(high_rad))
+    theta = np.arccos(cos_theta)
+    return float(np.degrees(theta))
+
+
+def build_balanced_sign_pairs(num_positive, rng):
+    base_pairs = np.array(
+        [
+            (+1.0, +1.0),
+            (+1.0, -1.0),
+            (-1.0, +1.0),
+            (-1.0, -1.0),
+        ],
+        dtype=np.float32,
+    )
+    repeats = int(math.ceil(num_positive / len(base_pairs)))
+    sign_pairs = np.tile(base_pairs, (repeats, 1))[:num_positive]
+    rng.shuffle(sign_pairs)
+    return sign_pairs
+
+
 def max_fully_contained_radius_deg():
     center = (PATCH_PIX - 1) / 2.0
     axis_offset_rad = np.radians(center * RESO_ARCMIN / 60.0)
@@ -199,30 +309,77 @@ def make_positive_preview(indices, patches, masks, metadata, output_path):
     if len(indices) == 0:
         return
 
-    fig, axes = plt.subplots(len(indices), 2, figsize=(10, 4 * len(indices)))
+    theta_grid = make_angular_distance_grid(PATCH_PIX, RESO_ARCMIN)
+    fig, axes = plt.subplots(len(indices), 3, figsize=(14, 4 * len(indices)))
     axes = np.atleast_2d(axes)
 
     for row, idx in enumerate(indices):
         patch_ax = axes[row, 0]
-        mask_ax = axes[row, 1]
+        signal_ax = axes[row, 1]
+        mask_ax = axes[row, 2]
 
         patch_ax.imshow(patches[idx], cmap="RdBu_r", origin="lower")
         patch_ax.set_title(
             "Patch\n"
             f"lon={metadata['glon_deg'][idx]:.1f}, lat={metadata['glat_deg'][idx]:.1f}\n"
             f"R={metadata['theta_crit_deg'][idx]:.1f} deg, "
-            f"z0={metadata['z0'][idx]:.2e}, zcrit={metadata['zcrit'][idx]:.2e}",
+            f"z0={metadata['z0'][idx]:.2e}, zcrit={metadata['zcrit'][idx]:.2e}, "
+            f"sigma={metadata['edge_sigma_deg'][idx]:.2f}",
             fontsize=10,
         )
         patch_ax.set_xticks([])
         patch_ax.set_yticks([])
+
+        signal = bubble_collision_signal(
+            theta_grid,
+            float(metadata["z0"][idx]),
+            float(metadata["zcrit"][idx]),
+            np.radians(float(metadata["theta_crit_deg"][idx])),
+            edge_sigma_deg=float(metadata["edge_sigma_deg"][idx]),
+        )
+        signal_ax.imshow(signal, cmap="RdBu_r", origin="lower")
+        signal_ax.set_title("Injected signal template", fontsize=10)
+        signal_ax.set_xticks([])
+        signal_ax.set_yticks([])
 
         mask_ax.imshow(masks[idx], cmap="gray", origin="lower", vmin=0, vmax=1)
         mask_ax.set_title("Target mask", fontsize=10)
         mask_ax.set_xticks([])
         mask_ax.set_yticks([])
 
-    fig.suptitle("Positive samples and masks", fontsize=14)
+    fig.suptitle("Positive patches, injected templates, and masks", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def make_validation_histograms(labels, metadata, output_path):
+    pos = labels == 1
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+    axes = axes.ravel()
+
+    axes[0].hist(metadata["glon_deg"], bins=30, color="#2563eb", alpha=0.85)
+    axes[0].set_title("Galactic longitude")
+
+    axes[1].hist(metadata["glat_deg"], bins=30, color="#0891b2", alpha=0.85)
+    axes[1].set_title("Galactic latitude")
+
+    axes[2].hist(metadata["theta_crit_deg"][pos], bins=30, color="#7c3aed", alpha=0.85)
+    axes[2].set_title(r"$\theta_{\rm crit}$")
+
+    axes[3].hist(metadata["z0"][pos], bins=30, color="#dc2626", alpha=0.85)
+    axes[3].set_title(r"$z_0$")
+
+    axes[4].hist(metadata["zcrit"][pos], bins=30, color="#ea580c", alpha=0.85)
+    axes[4].set_title(r"$z_{\rm crit}$")
+
+    axes[5].hist(metadata["edge_sigma_deg"][pos], bins=30, color="#16a34a", alpha=0.85)
+    axes[5].set_title("Edge sigma (deg)")
+
+    for ax in axes:
+        ax.grid(alpha=0.25)
+
+    fig.suptitle("Phase 2 parameter validation", fontsize=14)
     plt.tight_layout()
     plt.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -235,6 +392,7 @@ def save_outputs(output_dir, patches, labels, masks, metadata, summary, preview_
     summary_path = os.path.join(output_dir, "summary.json")
     preview_samples_path = os.path.join(output_dir, "preview_samples.png")
     preview_positives_path = os.path.join(output_dir, "preview_positives.png")
+    validation_hist_path = os.path.join(output_dir, "validation_histograms.png")
 
     with h5py.File(h5_path, "w") as h5:
         h5.create_dataset("patches", data=patches.astype(np.float32), compression="gzip", shuffle=True)
@@ -268,21 +426,25 @@ def save_outputs(output_dir, patches, labels, masks, metadata, summary, preview_
         metadata,
         preview_positives_path,
     )
+    make_validation_histograms(labels, metadata, validation_hist_path)
 
     print("\n=== Saved outputs ===")
     print(f"  {h5_path}")
     print(f"  {summary_path}")
     print(f"  {preview_samples_path}")
     print(f"  {preview_positives_path}")
+    print(f"  {validation_hist_path}")
 
 
 def main():
     args = parse_args()
     ensure_even_sample_count(args.num_samples)
+    validate_smoothing_args(args)
 
     rng = np.random.default_rng(args.seed)
-    smica_256, mask_256, sky_fraction = load_smica_and_mask()
+    mask_256, sky_fraction = load_mask()
     coord_pool = build_coordinate_pool(mask_256, args.pool_size, rng)
+    cmb_realizations, camb_params = generate_camb_realizations(args.num_cmb_realizations, rng)
 
     theta_grid = make_angular_distance_grid(PATCH_PIX, RESO_ARCMIN)
     contained_radius_deg = max_fully_contained_radius_deg()
@@ -307,30 +469,46 @@ def main():
 
     glon_deg = np.empty(num_samples, dtype=np.float32)
     glat_deg = np.empty(num_samples, dtype=np.float32)
+    cmb_realization_idx = np.full(num_samples, -1, dtype=np.int32)
     theta_crit_deg = np.full(num_samples, np.nan, dtype=np.float32)
     z0 = np.full(num_samples, np.nan, dtype=np.float32)
     zcrit = np.full(num_samples, np.nan, dtype=np.float32)
+    edge_sigma_deg = np.full(num_samples, np.nan, dtype=np.float32)
 
     positive_flags = np.zeros(num_samples, dtype=bool)
     positive_flags[:num_positive] = True
     rng.shuffle(positive_flags)
+    sign_pairs = build_balanced_sign_pairs(num_positive, rng)
+    positive_counter = 0
 
     for idx in range(num_samples):
         coord_idx = rng.integers(0, len(coord_pool))
         lon_i, lat_i = coord_pool[coord_idx]
-        clean_patch = np.asarray(project_patch(smica_256, float(lon_i), float(lat_i)), dtype=np.float32)
+        realization_idx_i = int(rng.integers(0, len(cmb_realizations)))
+        clean_patch = np.asarray(
+            project_patch(cmb_realizations[realization_idx_i], float(lon_i), float(lat_i)),
+            dtype=np.float32,
+        )
 
         glon_deg[idx] = lon_i
         glat_deg[idx] = lat_i
+        cmb_realization_idx[idx] = realization_idx_i
 
         if positive_flags[idx]:
             label = 1
-            theta_i = rng.uniform(5.0, 25.0)
-            z0_i = sample_log_uniform(rng, 1e-6, 1e-4)
-            zcrit_i = sample_log_uniform(rng, 1e-6, 1e-4)
-            zcrit_i *= -1.0 if rng.random() < 0.5 else 1.0
+            theta_i = sample_theta_crit_from_sin_prior(rng, 5.0, 25.0)
+            sign_z0_i, sign_zcrit_i = sign_pairs[positive_counter]
+            z0_i = sign_z0_i * sample_log_uniform(rng, 1e-6, 1e-4)
+            zcrit_i = sign_zcrit_i * sample_log_uniform(rng, 1e-6, 1e-4)
+            edge_sigma_i = rng.uniform(args.edge_sigma_min_deg, args.edge_sigma_max_deg)
 
-            patch_i, _ = inject_signal_into_patch(clean_patch, z0_i, zcrit_i, theta_i)
+            patch_i, _ = inject_signal_into_patch(
+                clean_patch,
+                z0_i,
+                zcrit_i,
+                theta_i,
+                edge_sigma_deg=edge_sigma_i,
+            )
             mask_i = make_centered_disk_mask(theta_grid, theta_i)
 
             patches[idx] = np.asarray(patch_i, dtype=np.float32)
@@ -339,6 +517,8 @@ def main():
             theta_crit_deg[idx] = theta_i
             z0[idx] = z0_i
             zcrit[idx] = zcrit_i
+            edge_sigma_deg[idx] = edge_sigma_i
+            positive_counter += 1
         else:
             patches[idx] = clean_patch
 
@@ -352,9 +532,11 @@ def main():
     metadata = {
         "glon_deg": glon_deg,
         "glat_deg": glat_deg,
+        "cmb_realization_idx": cmb_realization_idx,
         "theta_crit_deg": theta_crit_deg,
         "z0": z0,
         "zcrit": zcrit,
+        "edge_sigma_deg": edge_sigma_deg,
         "is_positive": labels.astype(np.uint8),
     }
     summary = {
@@ -362,13 +544,20 @@ def main():
         "num_positive": int(labels.sum()),
         "num_negative": int(num_samples - labels.sum()),
         "pool_size": int(len(coord_pool)),
+        "num_cmb_realizations": int(args.num_cmb_realizations),
         "seed": int(args.seed),
         "preview_count": int(args.preview_count),
         "nside": int(NSIDE_WORKING),
         "patch_pixels": int(PATCH_PIX),
         "reso_arcmin": float(RESO_ARCMIN),
         "mask_threshold": float(MASK_THRESHOLD),
+        "edge_sigma_min_deg": float(args.edge_sigma_min_deg),
+        "edge_sigma_max_deg": float(args.edge_sigma_max_deg),
         "sky_fraction": float(sky_fraction),
+        "theta_prior": "sin(theta_crit)",
+        "z0_sign_sampling": "balanced",
+        "zcrit_sign_sampling": "balanced",
+        "camb_params": json.dumps(camb_params, sort_keys=True),
         "output_dir": os.path.abspath(args.output_dir),
         "dataset_path": os.path.abspath(os.path.join(args.output_dir, "training_data.h5")),
         "created_utc": dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",

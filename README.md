@@ -25,7 +25,7 @@ $$\frac{\delta T}{T} = \left[ \frac{z_{\text{crit}} - z_0 \cos\theta_{\text{crit
 
 ## Progress
 
-### Phase 1: Data Foundation — ✅ Complete
+### Phase 1: Data Foundation - Complete
 
 Downloaded the Planck 2018 SMICA cleaned CMB map, loaded and visualized HEALPix data, degraded to working resolution (Nside=256), applied the galactic mask, and extracted gnomonic (tangent-plane) projections as flat 256×256 patches at 13 arcmin/pixel.
 
@@ -41,9 +41,11 @@ Downloaded the Planck 2018 SMICA cleaned CMB map, loaded and visualized HEALPix 
 
 ![Gnomonic patch near Cold Spot](plots/04_gnomonic_cold_spot.png)
 
-### Phase 2: Synthetic Data Generator — Near Complete
+### Phase 2: Synthetic Data Generator - Complete
 
-Implemented the bubble collision signal model from Feeney et al. (2011) Eq. 1 and verified the multiplicative injection step against Feeney et al. (2011) Eq. 15. The generator now builds training data directly from real Planck SMICA sky patches, using random unmasked sky locations, centered synthetic injections, binary segmentation masks, and saved metadata for each sample.
+Implemented the bubble collision signal model from Feeney et al. (2011) Eq. 1 and the multiplicative injection rule from Eq. 15. The training generator does not train on the single real SMICA sky. Instead, it generates many independent CAMB CMB realizations using Planck 2018 best-fit cosmological parameters and injects bubble-collision signals into those simulated skies. This makes the model learn the collision pattern on top of generic CMB fluctuations rather than one particular sky realization.
+
+SMICA is still the inference target. The trained model will be run on the real Planck SMICA map. The Planck galactic mask is still used in Phase 2, but only to choose clean sky coordinates so the training patch geometry matches the final inference setup.
 
 **Signal profile at three angular scales (5°, 10°, 25°):**
 
@@ -59,23 +61,34 @@ Top row: signal template in isolation. Bottom row: the same patch of real CMB sk
 
 ![Parameter space grid](plots/08_parameter_space_grid.png)
 
-**Training-sample collage from the current Phase 2 generator (1000-sample inspection run):**
+**Phase 2 training examples from the final dataset:**
 
-This preview was generated from the actual training pipeline after checking that the sky locations vary, the angular scales and amplitudes vary, the masks match the injected disks, and the extracted patches stay safely away from badly masked regions.
+Each column shows the target mask, the injected template, and the raw patch, with concise sample parameters above. The examples include a blue disk, a red disk with a blue rim, a faint mixed-sign case, and two larger disks at different angular scales. The full training set still spans weaker injections down to 10⁻⁶.
 
-![Phase 2 training sample collage](plots/09_training_samples.png)
+<img src="plots/09_training_samples.png" alt="Phase 2 training examples" width="760">
 
-Phase 2 checklist:
-- [x] Reused the Planck SMICA + galactic mask loading flow from Phase 1
+Phase 2 changes made for scientific reasons:
+- [x] Replaced single-map SMICA training patches with many independent CAMB realizations
+- [x] Kept the Planck mask to choose clean sky coordinates
+- [x] Sampled $\theta_{\rm crit}$ from the $\sin(\theta_{\rm crit})$ prior discussed around Feeney et al. (2011) Eq. 2
+- [x] Balanced the signs of $z_0$ and $z_{\rm crit}$ across all four sign combinations
+- [x] Added boundary smoothing to every positive sample to reflect the sub-degree edge smearing discussed by Feeney et al. (2011)
+- [x] Kept the target mask as the circular affected region on the sky
+- [x] Fixed the CAMB normalization so the simulations use raw $C_\ell$ when generating CMB skies
+- [x] Saved patches, labels, masks, parameters, and validation metadata to HDF5
+
+Current Phase 2 status:
 - [x] Built a valid coordinate pool from unmasked sky locations
 - [x] Generated balanced positive and negative 256×256 training patches
 - [x] Covered Feeney's 5°–25° angular range at 13 arcmin/pixel
-- [x] Saved patches, labels, binary masks, and injection parameters to HDF5
-- [x] Ran a 1000-sample visual verification pass and a 10000-sample production run locally
-
-Still to do:
-- [ ] Generate CMB realizations using CAMB (or work with Planck noise maps)
-- [ ] Validate injection statistics across parameter ranges
+- [x] Generated CAMB realizations for training backgrounds
+- [x] Built an automated injection pipeline
+- [x] Balanced $z_0$ and $z_{\rm crit}$ across all four sign quadrants
+- [x] Applied edge smoothing in the range 0.3°–1.0° to every positive sample
+- [x] Sampled $\theta_{\rm crit}$ from the physical $\sin(\theta_{\rm crit})$ prior
+- [x] Completed basic dataset validation: parameter histograms, sign balance, NaN checks, and preview inspection
+- [x] Ran a 1000-sample verification dataset locally
+- [x] Ran a 10000-sample production dataset locally
 
 ### Phase 3: U-Net Model — Upcoming
 
@@ -111,14 +124,14 @@ python scripts/phase1_explore.py
 # Phase 2: Generate signal model visualizations
 python scripts/phase2_signal_model.py
 
-# Phase 2: Generate inspectable training patches from real SMICA sky regions
+# Phase 2: Generate training patches using CAMB realizations and Planck mask geometry
 python scripts/phase2_generate_training.py
 
 # First verification pass
-python scripts/phase2_generate_training.py --num-samples 1000 --pool-size 2000
+python scripts/phase2_generate_training.py --num-samples 1000 --pool-size 2000 --num-cmb-realizations 192
 
 # Larger local training set
-python scripts/phase2_generate_training.py --num-samples 10000 --pool-size 5000
+python scripts/phase2_generate_training.py --num-samples 10000 --pool-size 5000 --num-cmb-realizations 192
 ```
 
 ## Datasets
