@@ -1,8 +1,18 @@
-# Data files (large FITS maps, don't commit)
+# Data files (large FITS maps and generated datasets, don't commit)
 data/*.fits
 data/*.fits.gz
+data/**/*.fits
+data/**/*.fits.gz
+data/**/*.h5
+data/**/*.npz
 data/training*/
+data/validation*/
 runs/
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.npz
 
 # Local tool state
 .codex
@@ -11,6 +21,7 @@ runs/
 
 # Python
 __pycache__/
+scripts/__pycache__/
 *.pyc
 *.pyo
 *.egg-info/

@@ -1,212 +1,277 @@
 # CMB Bubble Collision Detection
 
-A deep learning pipeline for detecting bubble collision signatures in Cosmic Microwave Background data using the Planck 2018 full sky release.
+Planck-era machine-learning candidate screening for localized bubble-collision signatures in the Cosmic Microwave Background.
 
-## Background
+This repository is not claiming a cosmological detection. It implements and audits a reproducible screening front end: generate physically motivated candidates, rank them, emit structured outputs, and hand promising regions to classical or Bayesian follow-up. That framing is deliberate. Feeney et al.'s WMAP pipeline did candidate localization, edge checks, Bayesian parameter estimation, model comparison against LambdaCDM, and interpretation in terms of the expected detectable collision count. This project currently covers the candidate-screening and handoff layer.
 
-In 2011, Feeney, Johnson, Mortlock, and Peiris published the first observational search for bubble collision signatures in CMB data using classical Bayesian methods and blob detection on WMAP 7-year data. They found four candidate features, but the results were inconclusive due to sensitivity limitations. They explicitly called for the search to be repeated with Planck satellite data using more powerful computational tools.
+Working claim:
 
-The follow-up using modern deep learning remains largely unexplored.
+> A reproducible Planck-era ML candidate-screening method for localized bubble-collision signatures, intended to accelerate or supplement classical follow-up.
 
-This project builds a U-Net segmentation model trained on simulated bubble collision signatures and applies it to Planck 2018 CMB data — supplementing the classical pipeline with an ML screening stage.
+## Current State
 
-## What Is a Bubble Collision Signature?
+- Phase 1 defines the observable domain: Planck 2018 cleaned maps, mask-aware sky coordinates, and gnomonic patch geometry.
+- Phase 2 builds the current synthetic generator: Feeney Eq. 1 disc templates, multiplicative injection, CAMB backgrounds, Planck mask geometry, beam/noise realism, provenance-clean splits, and real-map null controls.
+- Phase 3 contains the current screening stack: U-Net branches, boundary-aware variants, matched-template and centered-disc baselines, sensitivity curves, real-SMICA recalibration, threshold-volume analysis, and machine-readable candidate outputs.
+- The best current interpretation is operational, not triumphant: ML improves screening and morphology relative to simple classical screens in several regimes, but recall remains limited for low-amplitude, small-radius, weak-edge cases.
+- A focused Nside=512 probe did not justify a full 512 retrain. Positive-only recall improved only by saturating on real-SMICA nulls. The current practical baseline remains Nside=256 with calibrated operating points.
 
-Some theories of cosmic inflation predict our universe is one bubble in a larger multiverse. If another bubble universe collided with ours, it would leave a physical imprint in the CMB: a circular, azimuthally symmetric temperature modulation confined to a disk on the sky. The signature is parameterized by five values:
+## Signal Model
 
-- **z₀** — temperature amplitude at the center of the disk
-- **z_crit** — temperature discontinuity at the causal boundary (edge)
-- **θ_crit** — angular radius of the disk (searched range: 5°–25°)
-- **θ₀, φ₀** — sky coordinates of the disk center
+Bubble-collision signatures are modeled as localized, azimuthally symmetric CMB temperature modulations confined to a causal disc. Following Feeney, Johnson, Mortlock, and Peiris, the leading-order template is
 
-The signal model follows [Feeney et al. (2011), Eq. 1](https://arxiv.org/abs/1012.1995):
+```math
+\frac{\delta T}{T} =
+\left[
+\frac{z_{\rm crit} - z_0 \cos\theta_{\rm crit}}{1 - \cos\theta_{\rm crit}}
++
+\frac{z_0 - z_{\rm crit}}{1 - \cos\theta_{\rm crit}}\cos\theta
+\right]\Theta(\theta_{\rm crit}-\theta).
+```
 
-$$\frac{\delta T}{T} = \left[ \frac{z_{\text{crit}} - z_0 \cos\theta_{\text{crit}}}{1 - \cos\theta_{\text{crit}}} + \frac{z_0 - z_{\text{crit}}}{1 - \cos\theta_{\text{crit}}} \cos\theta \right] \Theta(\theta_{\text{crit}} - \theta)$$
+Key parameters:
 
-## Progress
+- `z0`: central modulation amplitude.
+- `zcrit`: boundary amplitude/discontinuity term.
+- `theta_crit`: angular radius of the affected disc, currently sampled over `5 deg` to `25 deg`.
+- `theta0, phi0`: sky position of the disc center.
 
-### Phase 1: Data Foundation - Complete
+The generator uses the multiplicative injection form, not an additive shortcut:
 
-Downloaded the Planck 2018 SMICA cleaned CMB map, loaded and visualized HEALPix data, degraded to working resolution (Nside=256), applied the galactic mask, and extracted gnomonic (tangent-plane) projections as flat 256×256 patches at 13 arcmin/pixel.
+```math
+T_{\rm injected} = (1 + f)(T_{\rm CMB}) .
+```
 
-**Full-sky Planck 2018 SMICA CMB (Nside=2048, 50 million pixels):**
+The `sin(theta_crit)` sampling law in this repository is a training-design choice motivated by the Feeney geometry discussion. It is not a Bayesian inference prior.
+
+## Data And Geometry
+
+The observable domain is Planck-era, patch-based, and mask-aware.
 
 ![Planck 2018 SMICA full-sky CMB map](plots/01_smica_fullsky.png)
 
-**With galactic mask applied (78% sky unmasked) at Nside=256:**
+**Figure 1.** Planck 2018 SMICA CMB map. SMICA is the primary real-map target for the current screening and null-control tests.
 
 ![SMICA with galactic mask](plots/03_smica_masked.png)
 
-**Gnomonic (flat-sky) patch near the CMB Cold Spot — this is the input format for the U-Net:**
+**Figure 2.** Planck common mask applied to the cleaned CMB map. The coordinate pool is drawn from clean unmasked regions with mask-fraction checks, not only center-pixel checks.
 
 ![Gnomonic patch near Cold Spot](plots/04_gnomonic_cold_spot.png)
 
-### Phase 2: Synthetic Data Generator - Complete
+**Figure 3.** Example gnomonic patch. The current working product uses `256 x 256` patches at `13 arcmin/pixel`, covering roughly `55 deg` across.
 
-Implemented the bubble collision signal model from Feeney et al. (2011) Eq. 1 and the multiplicative injection rule from Eq. 15. The training generator does not train on the single real SMICA sky. Instead, it generates many independent CAMB CMB realizations using Planck 2018 best-fit cosmological parameters and injects bubble-collision signals into those simulated skies. This makes the model learn the collision pattern on top of generic CMB fluctuations rather than one particular sky realization.
+## Phase 2 Generator
 
-SMICA is still the inference target. The trained model will be run on the real Planck SMICA map. The Planck galactic mask is still used in Phase 2, but only to choose clean sky coordinates so the training patch geometry matches the final inference setup.
+The current generator is intentionally stricter than an early ML demo:
 
-**Representative signal profiles used by the current generator:**
+- It uses independent CAMB CMB realizations rather than repeatedly training on one real SMICA sky.
+- It injects Feeney-style disc templates multiplicatively.
+- It balances sign quadrants for `z0` and `zcrit`.
+- It randomizes signal centers within patches to remove center-bias shortcut learning.
+- It enforces provenance-clean train/validation splits by coordinate and CMB realization.
+- It supports beam smoothing, instrumental noise, real-map null controls, and stratified validation products.
+- It stores metadata needed to trace patches back to sky coordinates and generation settings.
 
 ![Phase 2 signal profiles](plots/06_phase2_signal_profiles.png)
 
-**Validation from the final 10000-sample Phase 2 dataset:**
-
-The final dataset follows the `sin(theta_crit)` size prior, covers the full `1e-6` to `1e-4` amplitude range for both `z0` and `z_crit`, applies edge smoothing from `0.3°` to `1.0°`, and balances all four sign quadrants.
+**Figure 4.** Representative Feeney-template profiles. The generator preserves the long-wavelength disc modulation and causal-boundary structure instead of using generic circular blobs.
 
 ![Phase 2 validation](plots/07_phase2_validation.png)
 
-**Five representative Phase 2 examples from the final dataset:**
-
-Each column shows the target mask, the injected template, and the raw patch, with concise sample parameters above. The examples include a blue disk, a red disk with a blue rim, a faint mixed-sign case, and two larger disks at different angular scales.
+**Figure 5.** Phase 2 distribution checks. These checks exist to prevent the model from learning hidden generator shortcuts such as one sign quadrant, one radius band, or a narrow amplitude slice.
 
 <img src="plots/08_phase2_examples.png" alt="Phase 2 training examples" width="760">
 
-Phase 2 changes made for scientific reasons:
-- [x] Replaced single-map SMICA training patches with many independent CAMB realizations
-- [x] Kept the Planck mask to choose clean sky coordinates
-- [x] Sampled $\theta_{\rm crit}$ from a training prior proportional to $\sin(\theta_{\rm crit})$, motivated by Eq.2 and chosen for this Planck-era synthetic generator.
-- [x] Balanced the signs of $z_0$ and $z_{\rm crit}$ across all four sign combinations
-- [x] Added boundary smoothing as a heuristic robustness augmentation motivated by the paper’s discussion of possible sub-degree boundary smearing.
-- [x] Kept the target mask as the circular affected region on the sky
-- [x] Fixed the CAMB normalization so the simulations use raw $C_\ell$ when generating CMB skies
-- [x] Saved patches, labels, masks, parameters, and validation metadata to HDF5
+**Figure 6.** Example synthetic training patches. The lower visual salience of many examples is intentional: the data include weak amplitudes, mixed signs, off-center discs, beam/noise effects, and smoothed boundaries, all of which are closer to the Feeney search problem than centered high-SNR toy discs.
 
-Current Phase 2 status:
-- [x] Built a valid coordinate pool from unmasked sky locations
-- [x] Generated balanced positive and negative 256×256 training patches
-- [x] Covered Feeney's 5°–25° angular range at 13 arcmin/pixel
-- [x] Generated CAMB realizations for training backgrounds
-- [x] Built an automated injection pipeline
-- [x] Balanced $z_0$ and $z_{\rm crit}$ across all four sign quadrants
-- [x] Applied edge smoothing in the range 0.3°–1.0° to every positive sample
-- [x] Randomized the positive signal center within each patch to break center-bias shortcut learning
-- [x] Completed basic dataset validation: parameter histograms, sign balance, NaN checks, and preview inspection
-- [x] Ran a 1000-sample verification dataset locally
-- [x] Ran a 10000-sample production dataset locally
+## Phase 3 Screening Results
 
-### Phase 3: U-Net Model — Initial Baseline Complete
+Phase 3 is now evaluated against classical baselines on the same audited splits. The most useful current ML branch is `v6_aux_only` for morphology, with `v5_consensus`, `score_avg`, and `matched_template` retained for operating-policy comparisons.
 
-The Phase 3 training entrypoint is `scripts/phase3_train_unet.py`. It trains a U-Net with an EfficientNet encoder on the Phase 2 HDF5 dataset, uses a reproducible train/validation split, computes dataset normalization from the training subset, reweights BCE by the positive-pixel fraction, supports multi-GPU training, and saves checkpoints plus validation prediction previews.
+At matched synthetic FPR `0.08` on the independent stratified validation set:
 
-The first full baseline run used the off-center 10k synthetic dataset, filtered positives to `|z| >= 3e-5` for the initial high-SNR pass, and trained on a balanced 4544-patch candidate set (4090 train / 454 val) across 2× RTX 3090 GPUs.
+| method | AUROC | AUPRC | recall | weak recall | positive Dice |
+|---|---:|---:|---:|---:|---:|
+| matched template | `0.712` | `0.881` | `0.401` | `0.282` | `0.295` |
+| centered disc | `0.639` | `0.833` | `0.252` | `0.176` | `0.046` |
+| original V4 | `0.775` | `0.914` | `0.541` | `0.425` | `0.344` |
+| boundary V4 | `0.774` | `0.914` | `0.540` | `0.420` | `0.377` |
+| V5 consensus | `0.774` | `0.913` | `0.536` | `0.422` | `0.396` |
+| V6 aux only | `0.773` | `0.913` | `0.539` | `0.422` | `0.401` |
 
-**Baseline synthetic-validation results from the finished 20-epoch run:**
+![Phase 3 method comparison](plots/09_phase3_method_comparison.png)
 
-| Setting | Threshold | Precision | Recall | Image F1 | False Positive Rate | Positive Dice | Positive IoU |
-|---------|-----------|-----------|--------|----------|---------------------|---------------|--------------|
-| Final training configuration | 0.92 | 0.879 | 0.833 | 0.855 | 0.115 | 0.720 | 0.668 |
-| Best threshold from evaluator | 0.96 | 0.916 | 0.815 | 0.862 | 0.075 | 0.687 | 0.631 |
+**Figure 7.** Current Phase 3 comparison at matched FPR. The metrics are lower than early high-SNR baselines because the current data intentionally removes shortcuts: off-center injection, provenance-clean splits, weak amplitudes, smoothed causal boundaries, beam/noise effects, and real-map null calibration. That is the right direction scientifically even when it makes headline recall less flattering.
 
-These numbers are on the held-out synthetic validation split, not on real Planck data yet. The key milestone is that the model now trains stably on off-center injections and no longer collapses into the earlier centered-disk shortcut.
+## Sensitivity Versus Matched Template
 
-**Training curves for the full 10k off-center baseline run:**
+At matched synthetic FPR `0.05`, the best ML branch significantly beats the beam-matched Feeney-template screen in `8 / 35` amplitude-radius cells and shows no significant losses. This is a localized gain, not universal dominance.
 
-![Phase 3 training curves](plots/09_phase3_training_curves.png)
+Representative significant cells:
 
-**Threshold sweep on the held-out synthetic validation split:**
+| amplitude `A` | `theta_crit` | matched template `P_det` | best ML `P_det` |
+|---:|---:|---:|---:|
+| `1e-5` | `25 deg` | `0.065` | `0.175` |
+| `2e-5` | `20 deg` | `0.235` | `0.555` |
+| `2e-5` | `25 deg` | `0.375` | `0.710` |
+| `5e-5` | `5 deg` | `0.065` | `0.295` |
+| `5e-5` | `10 deg` | `0.490` | `0.980` |
+| `1e-4` | `5 deg` | `0.500` | `0.980` |
 
-![Phase 3 threshold sweep](plots/10_phase3_threshold_sweep.png)
+![Phase 3 ML gain heatmap](plots/10_phase3_ml_gain_heatmap.png)
 
-**Positive validation examples at the evaluator-selected threshold (`0.96`):**
+**Figure 8.** Significant gain over a beam-matched template screen. Gray cells are not ML failures; they are cells where the confidence interval overlaps parity. The lower-left region remains hard because low amplitude and small angular radius give limited integrated signal-to-noise, especially after Feeney-faithful smoothing and realistic background structure.
 
-Each row shows the raw patch, the target mask, the model probability map, and the thresholded prediction.
+## Real-SMICA Calibration
 
-<img src="plots/11_phase3_positive_preview.png" alt="Phase 3 positive validation preview" width="760">
+A real-SMICA injection gate initially looked like a domain-gap failure. Recalibration showed the dominant issue was threshold mismatch:
 
-**Negative validation examples at the evaluator-selected threshold (`0.96`):**
+| method | CAMB threshold | SMICA-null threshold | real recall at CAMB threshold | real recall after SMICA recalibration |
+|---|---:|---:|---:|---:|
+| `v6_aux_only` | `0.992082` | `0.888469` | `0.262` | `0.353` |
+| `matched_template` | `76.977921` | `61.829514` | `0.238` | `0.323` |
 
-These rows are useful for checking whether the model is spuriously lighting up clean background patches.
+Interpretation: thresholds calibrated on CAMB negatives were too strict on real SMICA. The model transfers better than the first gate suggested, but recall is still a candidate-volume tradeoff rather than a solved detection problem.
 
-<img src="plots/12_phase3_negative_preview.png" alt="Phase 3 negative validation preview" width="760">
+## Threshold And Candidate Volume
 
-### Phase 4: Validation — Upcoming
+The current detector can recover more contested positives by lowering the threshold, but false-positive volume rises quickly.
 
-- Sensitivity curves at 5°, 10°, and 25° angular scales (detection rate vs. injection amplitude)
-- False positive rate on clean (no injection) patches
-- Precision-recall curves at varying detection thresholds
-- Injection-recovery tests on real Planck maps
-- GradCAM activation maps to verify model attention on correct spatial features
-- Direct comparison to Feeney et al. (2011) sensitivity benchmarks (Figures 11, 17)
+| threshold | contested recall | solved recall | expected FP over 3000 independent patches |
+|---:|---:|---:|---:|
+| `0.75` | `0.654` | `0.976` | `1631` |
+| `0.80` | `0.442` | `0.954` | `895` |
+| `0.85` | `0.278` | `0.940` | `401` |
+| `0.90` | `0.150` | `0.922` | `106` |
 
-### Phase 5: Planck Inference — Upcoming
+![Phase 3 threshold tradeoff](plots/11_phase3_threshold_tradeoff.png)
 
-Tile the full unmasked Planck sky with overlapping ~51° patches. Run inference and stitch outputs into a full-sky probability map. Identify candidate regions above detection threshold. Cross-reference against known CMB anomalies (Cold Spot, hemispherical asymmetry). Validate candidates across independent Planck cleaning pipelines (SMICA, NILC, SEVEM, Commander).
+**Figure 9.** Recall versus expected candidate burden. The numbers are lower than a toy segmentation benchmark because the operating point is being treated in the Feeney spirit: thresholds must be fixed against null controls before real-map use, rather than tuned after looking at candidates. High recall is available, but it costs hundreds to thousands of follow-up candidates.
 
-### Phase 6: Paper and Release — Upcoming
+<img src="plots/12_phase3_smoothed_examples.png" alt="Phase 3 smoothed positive examples" width="760">
 
-Write up results. Release trained model weights, synthetic data generator, and inference pipeline as open-source tools for the CMB research community.
+**Figure 10.** Diagnostic real-SMICA injection examples. The failures are informative: small-radius or low-amplitude discs often produce diffuse probability maps just below threshold, while larger or stronger discs are recovered cleanly. This is consistent with an integrated-SNR limitation, not simple model blindness.
+
+## Deployment Recipe
+
+Current Phase 3 should be used as a multi-score screening system.
+
+- Run `matched_template` as a classical reference and fallback.
+- Run `v5_consensus` as the default ML candidate score at threshold `0.99094790`.
+- Run `score_avg` as a conservative verifier/reranker at threshold `0.98226583`.
+- Run `v6_aux_only` for morphology and mask-quality audit.
+- Emit a verified candidate when `v5_consensus` fires and either `score_avg` or `matched_template` also fires.
+- Preserve all branch scores, thresholds, masks, estimated radius, sky metadata, and template-fit artifacts.
+
+The composite verified stream is high precision but not high recall:
+
+| policy | precision | recall | FPR | F1 |
+|---|---:|---:|---:|---:|
+| `v5_only` | `0.969` | `0.501` | `0.041` | `0.660` |
+| `score_avg_only` | `0.975` | `0.495` | `0.032` | `0.656` |
+| `matched_template_only` | `0.948` | `0.348` | `0.049` | `0.509` |
+| `normal_candidate` | `0.980` | `0.474` | `0.025` | `0.639` |
+
+On the `5000`-patch SMICA null-control set, `matched_template`, `v5_consensus`, `score_avg`, `normal_candidate`, and `all_candidates` each produced `0 / 5000` null candidates at their frozen thresholds.
+
+## What Is Not Solved
+
+- This is not yet a Feeney-style Bayesian detection framework.
+- It does not estimate a posterior over bubble-collision parameters.
+- It does not perform model selection against LambdaCDM.
+- It does not constrain the expected detectable collision count.
+- Weak-family recall remains the central blocker.
+- Nside=512 is not justified by the current focused probe.
+
+Current engineering targets:
+
+- Run full-sky Planck screening with map-calibrated thresholds and candidate clustering.
+- Calibrate thresholds separately for SMICA, NILC, SEVEM, and Commander.
+- Keep matched-template scores in every candidate record as a classical sanity check.
+- Add a scale-aware score or radius head only if it improves the weak small-radius cells without increasing real-map null burden.
+- Feed candidate records into a classical template-fit or Bayesian follow-up stage.
 
 ## Quick Start
 
+Create the environment:
+
 ```bash
-# Set up the environment
 conda env create -f environment.yml
 conda activate cmb
-
-# Phase 1: Download Planck data and generate exploration plots
-python scripts/phase1_explore.py
-
-# Phase 2: Generate signal model visualizations
-python scripts/phase2_signal_model.py
-
-# Phase 2: Generate training patches using CAMB realizations and Planck mask geometry
-python scripts/phase2_generate_training.py
-
-# First verification pass
-python scripts/phase2_generate_training.py --num-samples 1000 --pool-size 2000 --num-cmb-realizations 192
-
-# Larger local training set
-python scripts/phase2_generate_training.py --num-samples 10000 --pool-size 5000 --num-cmb-realizations 192
-
-# Phase 3: inspect the training split and normalization without starting training
-python scripts/phase3_train_unet.py --dry-run
-
-# Phase 3: train the segmentation model on the 10k off-center synthetic dataset
-python scripts/phase3_train_unet.py --data-h5 data/training_v3_10000/training_data.h5 --epochs 20 --batch-size 16 --threshold 0.92
-
-# Phase 3: evaluate a finished run and sweep thresholds on the validation split
-python scripts/phase3_evaluate_run.py --run-dir runs/phase3_unet/phase3_offcenter_10k_2gpu --checkpoint best --split val --num-workers 0
 ```
 
-For Phase 3 you still need a PyTorch install that matches your CUDA setup. A typical RTX 3090 setup is:
+Generate or inspect Phase 1 products:
 
 ```bash
-conda install pytorch torchvision pytorch-cuda=11.8 -c pytorch -c nvidia
+python scripts/phase1_explore.py
 ```
 
-## Datasets
+Run Phase 2 checks and generate the current training set:
 
-| Dataset            | Purpose                                        | Source                                             |
-|--------------------|------------------------------------------------|----------------------------------------------------|
-| Planck 2018 SMICA  | Primary inference target                       | [Planck Legacy Archive](https://pla.esac.esa.int/) |
-| CAMB simulations   | Synthetic CMB realizations for training        | Generated via [CAMB](https://camb.info/)           |
-| CMB-ML (ICCV 2025) | Pre-processed CMB data for ML                  | [CMB-ML](https://github.com/CMB-ML)               |
-| WMAP 7-year        | Additional validation / generalization testing | [LAMBDA](https://lambda.gsfc.nasa.gov/)            |
+```bash
+python scripts/phase2_physics_checks.py
+python scripts/phase2_generate_training.py \
+  --num-samples 10000 \
+  --pool-size 5000 \
+  --num-cmb-realizations 192 \
+  --output-dir data/training_v4
+python scripts/phase2_audit_dataset.py \
+  --data-h5 data/training_v4/training_data.h5 \
+  --output-json data/training_v4/audit_report.json
+```
 
-## Tech Stack
+Train and evaluate a Phase 3 branch:
 
-- **healpy** — HEALPix map handling and patch extraction
-- **CAMB** — CMB power spectrum and map simulation
-- **PyTorch** — Model training and inference
-- **segmentation-models-pytorch** — U-Net with EfficientNet encoder
-- **numpy / scipy** — Signal injection and data processing
+```bash
+python scripts/phase3_train_unet.py \
+  --data-h5 data/training_v4/training_data.h5 \
+  --epochs 20 \
+  --batch-size 16 \
+  --threshold 0.92
+
+python scripts/phase3_evaluate_run.py \
+  --run-dir runs/phase3_unet/phase3_v6_aux_only_w4 \
+  --checkpoint best \
+  --split val
+```
+
+Run key evaluation harnesses:
+
+```bash
+python scripts/phase3_sensitivity_curve.py
+python scripts/phase3_eval_stratified_external.py
+python scripts/phase3_eval_classical_stratified_external.py
+python scripts/phase3_real_sky_recalibration.py
+python scripts/phase3_threshold_volume_sweep.py
+python scripts/phase3_screen_and_verify.py
+```
+
+## Repository Layout
+
+- `scripts/phase1_explore.py`: Planck map loading, masking, and patch geometry.
+- `scripts/phase2_signal_model.py`: Feeney-template implementation and signal checks.
+- `scripts/phase2_generate_training.py`: current CAMB/Planck-mask training generator.
+- `scripts/phase2_audit_dataset.py`: provenance, split, and leakage audit.
+- `scripts/phase3_train_unet.py`: U-Net training harness.
+- `scripts/phase3_evaluate_run.py`: validation/evaluation harness.
+- `scripts/phase3_template_baseline.py`: matched-template and classical baseline support.
+- `scripts/phase3_screen_and_verify.py`: candidate-output CLI.
+- `docs/project_structure.md`: artifact policy and source organization.
+- `docs/nside512_probe_decision.md`: focused Nside=512 probe verdict.
+
+Generated datasets, Planck FITS maps, checkpoints, and run artifacts are intentionally ignored by git. The repository tracks source, documentation, compact figures, and reproducibility metadata, not multi-GB intermediates.
 
 ## Hardware
 
-- 2× NVIDIA RTX 3090 (48 GB VRAM total)
+The current local workstation has 2 NVIDIA RTX 3090 GPUs. The code supports multi-GPU training through PyTorch `DataParallel`.
 
 ## Key References
 
-- Feeney, Johnson, Mortlock & Peiris (2011). *First Observational Tests of Eternal Inflation: Analysis Methods and WMAP 7-Year Results.* [arXiv:1012.3667](https://arxiv.org/abs/1012.3667)
-- Feeney, Johnson, Mortlock & Peiris (2011). *First Observational Tests of Eternal Inflation* [arXiv:1012.1995](https://arxiv.org/abs/1012.1995)
-- Zhang et al. (2024). *CMBubbles: Bubble Collision Detection in the CMB.*
-- Górski et al. (2005). *HEALPix: A Framework for High-Resolution Discretization and Fast Analysis of Data Distributed on the Sphere.*
-
-## Why This Matters
-
-This project is not a discovery tool. It is a triage tool. It screens the full CMB sky in minutes and outputs a probability map flagging regions of interest for follow-up with traditional Bayesian analysis. Even a null result constrains the bubble collision parameter space. The pipeline is designed to be reusable on future CMB datasets (CMB-S4, Simons Observatory) where automated screening will be essential due to data volume.
+- Feeney, Johnson, Mortlock, and Peiris. *First Observational Tests of Eternal Inflation.* arXiv:1012.1995.
+- Feeney, Johnson, Mortlock, and Peiris. *First Observational Tests of Eternal Inflation: Analysis Methods and WMAP 7-Year Results.* arXiv:1012.3667.
+- Gorski et al. *HEALPix: A Framework for High-Resolution Discretization and Fast Analysis of Data Distributed on the Sphere.* Astrophysical Journal, 2005.
+- Lewis, Challinor, and Lasenby. *Efficient Computation of Cosmic Microwave Background Anisotropies in Closed Friedmann-Robertson-Walker Models.* Astrophysical Journal, 2000. CAMB.
+- Planck Collaboration. *Planck 2018 results. IV. Diffuse component separation.* Astronomy & Astrophysics, 2020.
 
 ## License
 

@@ -154,6 +154,7 @@ def inject_signal_into_patch(
     The Planck SMICA patch is a temperature-anisotropy map, so we reconstruct the
     full temperature as T0 + δT_cmb, apply the modulation, and subtract T0 again.
     """
+    patch = np.asarray(patch, dtype=np.float64)
     theta_grid = make_angular_distance_grid(
         patch.shape[0],
         RESO_ARCMIN,

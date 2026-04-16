@@ -1,31 +1,28 @@
 """
-Phase 3: Evaluate a trained U-Net checkpoint with threshold sweeps and previews.
+Phase 3 evaluation with fixed operating-point selection, structured candidate outputs,
+and physics-aware breakdowns.
 
-This script reuses the split, normalization, and model configuration saved by
-`phase3_train_unet.py` so a finished run can be scored consistently after
-training. The main outputs are:
-    - a threshold sweep JSON file
-    - a threshold sweep plot
-    - summary JSON with the best threshold on the chosen split
-    - separate positive/negative preview panels at the best threshold
+The evaluator reuses the split and normalization saved by `phase3_train_unet.py`,
+then performs:
+    - threshold sweeps on the requested split
+    - a frozen operating-point choice for screening use
+    - candidate extraction per patch with machine-readable outputs
+    - stratified metrics by angular size, amplitude, and edge strength
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 
-os.environ.setdefault("MPLCONFIGDIR", str(Path("/tmp") / "matplotlib"))
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import h5py
 import numpy as np
 import torch
 
+from phase3_audit_outputs import run_audit as run_output_audit
 import phase3_train_unet as p3
+from phase_dataset_utils import build_patch_candidate, load_metadata_array, load_optional_metadata_array, load_truth_array
 
 SELECTION_METRICS = (
     "image_f1",
@@ -35,11 +32,13 @@ SELECTION_METRICS = (
     "hard_dice_pos",
     "iou_pos",
 )
+OPERATING_POINT_RULES = ("fpr_cap", "metric_max")
+MASK_SHAPE = (256, 256)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate a saved Phase 3 checkpoint with a threshold sweep.",
+        description="Evaluate a saved Phase 3 checkpoint with threshold sweeps and structured candidate outputs.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--run-dir", type=str, required=True)
@@ -66,7 +65,20 @@ def parse_args():
         type=str,
         default="image_f1",
         choices=SELECTION_METRICS,
-        help="Metric used to choose the best threshold from the sweep.",
+        help="Only used when --operating-point-rule=metric_max.",
+    )
+    parser.add_argument(
+        "--operating-point-rule",
+        type=str,
+        default="fpr_cap",
+        choices=OPERATING_POINT_RULES,
+        help="Frozen threshold-selection rule used to choose the screening operating point.",
+    )
+    parser.add_argument(
+        "--target-fpr",
+        type=float,
+        default=0.10,
+        help="Image-level false-positive-rate cap used by --operating-point-rule=fpr_cap.",
     )
     parser.add_argument("--preview-count", type=int, default=6)
     parser.add_argument(
@@ -93,6 +105,8 @@ def validate_args(args):
         raise ValueError("--threshold-min must be smaller than --threshold-max.")
     if args.preview_count <= 0:
         raise ValueError("--preview-count must be positive.")
+    if not (0.0 <= args.target_fpr < 1.0):
+        raise ValueError("--target-fpr must be in [0, 1).")
 
 
 def load_json(path):
@@ -240,19 +254,20 @@ def maybe_collect_preview_samples(store, images, masks, logits, indices, max_exa
 def stack_preview_samples(samples):
     if not samples:
         return None
-    images = np.stack([sample["image"] for sample in samples], axis=0)
-    masks = np.stack([sample["mask"] for sample in samples], axis=0)
-    logits = np.stack([sample["logit"] for sample in samples], axis=0)
-    indices = np.asarray([sample["index"] for sample in samples], dtype=np.int64)
     return {
-        "images": images,
-        "masks": masks,
-        "logits": logits,
-        "indices": indices,
+        "images": np.stack([sample["image"] for sample in samples], axis=0),
+        "masks": np.stack([sample["mask"] for sample in samples], axis=0),
+        "logits": np.stack([sample["logit"] for sample in samples], axis=0),
+        "indices": np.asarray([sample["index"] for sample in samples], dtype=np.int64),
     }
 
 
-def save_threshold_sweep_plot(rows, output_path, best_threshold, selection_metric, configured_threshold):
+def save_threshold_sweep_plot(rows, output_path, best_threshold, selection_label, configured_threshold):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     thresholds = np.asarray([row["threshold"] for row in rows], dtype=np.float64)
     precision = np.asarray([row["image_precision"] for row in rows], dtype=np.float64)
     recall = np.asarray([row["image_recall"] for row in rows], dtype=np.float64)
@@ -268,7 +283,7 @@ def save_threshold_sweep_plot(rows, output_path, best_threshold, selection_metri
     axes[0].plot(thresholds, precision, label="precision", color="#2563eb")
     axes[0].plot(thresholds, recall, label="recall", color="#dc2626")
     axes[0].plot(thresholds, f1, label="F1", color="#16a34a")
-    axes[0].axvline(best_threshold, color="#111827", linestyle="--", linewidth=1.2, label="best")
+    axes[0].axvline(best_threshold, color="#111827", linestyle="--", linewidth=1.2, label="selected")
     axes[0].axvline(configured_threshold, color="#7c3aed", linestyle=":", linewidth=1.2, label="configured")
     axes[0].set_title("Image-level Metrics vs Threshold")
     axes[0].set_xlabel("Threshold")
@@ -299,22 +314,15 @@ def save_threshold_sweep_plot(rows, output_path, best_threshold, selection_metri
     axes[2].grid(alpha=0.25)
     axes[2].legend()
 
-    scatter = axes[3].scatter(
-        recall,
-        precision,
-        c=thresholds,
-        cmap="viridis",
-        s=28,
-        edgecolor="none",
-    )
-    best_idx = int(np.argmax([row[selection_metric] for row in rows]))
+    scatter = axes[3].scatter(recall, precision, c=thresholds, cmap="viridis", s=28, edgecolor="none")
+    best_idx = int(np.argmin(np.abs(thresholds - best_threshold)))
     axes[3].scatter(
         recall[best_idx],
         precision[best_idx],
         color="#111827",
         s=60,
         marker="x",
-        label=f"best {selection_metric}",
+        label=selection_label,
     )
     axes[3].set_title("Precision-Recall Curve")
     axes[3].set_xlabel("Recall")
@@ -341,7 +349,7 @@ def evaluate_thresholds(model, loader, thresholds, device, preview_count, split_
         for batch_idx, batch in enumerate(loader, start=1):
             images = batch["image"].to(device, non_blocking=True)
             masks = batch["mask"].to(device, non_blocking=True)
-            logits = model(images)
+            logits, _ = p3.unpack_model_output(model(images))
             probs = torch.sigmoid(logits)
 
             images_cpu = images.detach().cpu().numpy()
@@ -387,8 +395,249 @@ def choose_best_threshold(rows, selection_metric):
     return best_row
 
 
+def choose_operating_point(rows, operating_point_rule, selection_metric, target_fpr):
+    if operating_point_rule == "metric_max":
+        best_row = choose_best_threshold(rows, selection_metric)
+        return best_row, {
+            "rule": "metric_max",
+            "selection_metric": selection_metric,
+        }
+
+    feasible = [row for row in rows if row["image_false_positive_rate"] <= target_fpr + 1e-12]
+    if feasible:
+        best_row = max(
+            feasible,
+            key=lambda row: (
+                row["image_recall"],
+                row["image_precision"],
+                row["hard_dice_pos"],
+                row["threshold"],
+            ),
+        )
+        return best_row, {
+            "rule": "max_recall_under_fpr_cap",
+            "target_fpr": float(target_fpr),
+            "feasible_thresholds": int(len(feasible)),
+        }
+
+    best_row = min(
+        rows,
+        key=lambda row: (
+            row["image_false_positive_rate"],
+            -row["image_recall"],
+            -row["threshold"],
+        ),
+    )
+    return best_row, {
+        "rule": "fallback_min_fpr_then_max_recall",
+        "target_fpr": float(target_fpr),
+        "feasible_thresholds": 0,
+    }
+
+
 def find_closest_threshold_row(rows, target_threshold):
     return min(rows, key=lambda row: abs(row["threshold"] - target_threshold))
+
+
+def collect_prediction_artifacts(
+    model,
+    loader,
+    device,
+    threshold,
+    preview_count,
+    glon_lookup,
+    glat_lookup,
+    provenance_lookup,
+    truth_lookup,
+):
+    previews = {"positive": [], "negative": []}
+    candidate_records = []
+    mask_bits = []
+    sample_indices = []
+    progress = p3.ProgressPrinter(len(loader), "Collect predictions")
+
+    model.eval()
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(loader, start=1):
+            images = batch["image"].to(device, non_blocking=True)
+            masks = batch["mask"].to(device, non_blocking=True)
+            logits, _ = p3.unpack_model_output(model(images))
+            probs = torch.sigmoid(logits)
+
+            images_cpu = images.detach().cpu().numpy()
+            masks_cpu = masks.detach().cpu().numpy()
+            logits_cpu = logits.detach().cpu().numpy()
+            probs_cpu = probs.detach().cpu().numpy()
+            indices_cpu = np.asarray(batch["index"][:], dtype=np.int64)
+
+            maybe_collect_preview_samples(
+                previews,
+                images=images_cpu,
+                masks=masks_cpu,
+                logits=logits_cpu,
+                indices=indices_cpu,
+                max_examples=preview_count,
+            )
+
+            for row, sample_idx in enumerate(indices_cpu):
+                candidate, candidate_mask = build_patch_candidate(
+                    prob_map=probs_cpu[row, 0],
+                    threshold=threshold,
+                    patch_center_glon_deg=float(glon_lookup[sample_idx]),
+                    patch_center_glat_deg=float(glat_lookup[sample_idx]),
+                    sample_index=int(sample_idx),
+                )
+                candidate.update(
+                    {
+                        "truth_label": int(truth_lookup["has_signal"][sample_idx]),
+                        "truth_theta_crit_deg": float(truth_lookup["theta_crit_deg"][sample_idx]),
+                        "truth_z0": float(truth_lookup["z0"][sample_idx]),
+                        "truth_zcrit": float(truth_lookup["zcrit"][sample_idx]),
+                        "truth_edge_sigma_deg": float(truth_lookup["edge_sigma_deg"][sample_idx]),
+                        "truth_signal_center_dx_deg": float(truth_lookup["signal_center_dx_deg"][sample_idx]),
+                        "truth_signal_center_dy_deg": float(truth_lookup["signal_center_dy_deg"][sample_idx]),
+                        "coord_pool_idx": int(provenance_lookup["coord_pool_idx"][sample_idx]),
+                        "coord_mask_fraction": float(provenance_lookup["coord_mask_fraction"][sample_idx]),
+                        "cmb_realization_idx": int(provenance_lookup["cmb_realization_idx"][sample_idx]),
+                        "background_id": int(provenance_lookup["background_id"][sample_idx]),
+                    }
+                )
+                candidate_records.append(candidate)
+                sample_indices.append(int(sample_idx))
+                mask_bits.append(np.packbits(candidate_mask.reshape(-1)).astype(np.uint8))
+
+            progress.update(batch_idx)
+
+    return {
+        "records": candidate_records,
+        "sample_indices": np.asarray(sample_indices, dtype=np.int64),
+        "mask_bits": np.stack(mask_bits, axis=0),
+        "mask_shape": np.asarray(MASK_SHAPE, dtype=np.int32),
+        "previews": previews,
+    }
+
+
+def unpack_mask_row(mask_bits_row, mask_shape):
+    flat = np.unpackbits(mask_bits_row)[: int(np.prod(mask_shape))]
+    return flat.reshape(mask_shape).astype(bool)
+
+
+def positive_subset_metrics(mask_bits, sample_indices, truth_masks_h5, include_mask):
+    selected_positions = np.flatnonzero(include_mask)
+    if len(selected_positions) == 0:
+        return {"num_samples": 0}
+
+    hard_dice_sum = 0.0
+    iou_sum = 0.0
+    detected = 0
+    for position in selected_positions:
+        sample_idx = int(sample_indices[position])
+        pred = unpack_mask_row(mask_bits[position], MASK_SHAPE)
+        truth = np.asarray(truth_masks_h5[sample_idx], dtype=bool)
+        pred_any = bool(pred.any())
+        if pred_any:
+            detected += 1
+
+        intersection = float(np.logical_and(pred, truth).sum())
+        pred_sum = float(pred.sum())
+        truth_sum = float(truth.sum())
+        union = pred_sum + truth_sum - intersection
+        empty_both = pred_sum == 0.0 and truth_sum == 0.0
+        if empty_both:
+            hard_dice = 1.0
+            iou = 1.0
+        else:
+            hard_dice = (2.0 * intersection + p3.EPS) / (pred_sum + truth_sum + p3.EPS)
+            iou = (intersection + p3.EPS) / (union + p3.EPS)
+
+        hard_dice_sum += hard_dice
+        iou_sum += iou
+
+    n = max(len(selected_positions), 1)
+    return {
+        "num_samples": int(len(selected_positions)),
+        "detected": int(detected),
+        "image_recall": float(detected / n),
+        "hard_dice_pos": float(hard_dice_sum / n),
+        "iou_pos": float(iou_sum / n),
+    }
+
+
+def make_stratified_metrics(data_h5, artifact_bundle):
+    sample_indices = artifact_bundle["sample_indices"]
+    records = artifact_bundle["records"]
+    mask_bits = artifact_bundle["mask_bits"]
+
+    theta = np.asarray([record["truth_theta_crit_deg"] for record in records], dtype=np.float64)
+    signal_strength = np.asarray(
+        [max(abs(record["truth_z0"]), abs(record["truth_zcrit"])) for record in records],
+        dtype=np.float64,
+    )
+    edge_strength = np.asarray([abs(record["truth_zcrit"]) for record in records], dtype=np.float64)
+    has_signal = np.asarray([record["truth_label"] == 1 for record in records], dtype=bool)
+
+    theta_bins = [
+        ("5-10deg", (theta >= 5.0) & (theta < 10.0)),
+        ("10-15deg", (theta >= 10.0) & (theta < 15.0)),
+        ("15-20deg", (theta >= 15.0) & (theta < 20.0)),
+        ("20-25deg", (theta >= 20.0) & (theta <= 25.0)),
+    ]
+    amplitude_bins = [
+        ("1e-6_to_1e-5", (signal_strength >= 1e-6) & (signal_strength < 1e-5)),
+        ("1e-5_to_3e-5", (signal_strength >= 1e-5) & (signal_strength < 3e-5)),
+        ("3e-5_to_5e-5", (signal_strength >= 3e-5) & (signal_strength < 5e-5)),
+        ("5e-5_to_1e-4", (signal_strength >= 5e-5) & (signal_strength <= 1e-4)),
+    ]
+    edge_bins = [
+        ("smooth_|zcrit|<=5e-6", edge_strength <= 5e-6),
+        ("weak_5e-6_to_3e-5", (edge_strength > 5e-6) & (edge_strength < 3e-5)),
+        ("strong_|zcrit|>=3e-5", edge_strength >= 3e-5),
+    ]
+
+    stratified = {"theta_crit": {}, "amplitude": {}, "edge_strength": {}}
+    with h5py.File(data_h5, "r") as h5:
+        truth_masks_h5 = h5["masks"]
+        for name, mask in theta_bins:
+            stratified["theta_crit"][name] = positive_subset_metrics(
+                mask_bits=mask_bits,
+                sample_indices=sample_indices,
+                truth_masks_h5=truth_masks_h5,
+                include_mask=has_signal & mask,
+            )
+        for name, mask in amplitude_bins:
+            stratified["amplitude"][name] = positive_subset_metrics(
+                mask_bits=mask_bits,
+                sample_indices=sample_indices,
+                truth_masks_h5=truth_masks_h5,
+                include_mask=has_signal & mask,
+            )
+        for name, mask in edge_bins:
+            stratified["edge_strength"][name] = positive_subset_metrics(
+                mask_bits=mask_bits,
+                sample_indices=sample_indices,
+                truth_masks_h5=truth_masks_h5,
+                include_mask=has_signal & mask,
+            )
+    return stratified
+
+
+def save_candidate_outputs(output_dir, artifact_bundle):
+    candidate_records_path = output_dir / "candidate_records.jsonl"
+    candidate_masks_path = output_dir / "candidate_masks.npz"
+
+    with open(candidate_records_path, "w", encoding="utf-8") as handle:
+        for row_id, record in enumerate(artifact_bundle["records"]):
+            payload = dict(record)
+            payload["mask_row"] = row_id
+            handle.write(json.dumps(payload) + "\n")
+
+    np.savez_compressed(
+        candidate_masks_path,
+        sample_indices=artifact_bundle["sample_indices"],
+        mask_bits=artifact_bundle["mask_bits"],
+        mask_shape=artifact_bundle["mask_shape"],
+    )
+    return candidate_records_path, candidate_masks_path
 
 
 def main():
@@ -417,8 +666,7 @@ def main():
     dataset = p3.H5BubbleDataset(
         h5_path=data_h5,
         indices=split_indices,
-        mean=mean,
-        std=std,
+        **p3.dataset_kwargs_from_run_config(run_config),
         augment=False,
         seed=int(train_args["seed"]) + (0 if args.split == "train" else 1),
         max_translate_pixels=0,
@@ -433,12 +681,9 @@ def main():
         persistent_workers=args.num_workers > 0,
     )
 
-    model_args = argparse.Namespace(
-        encoder_name=train_args["encoder_name"],
-        encoder_weights=train_args["encoder_weights"],
-    )
+    model_args = p3.model_args_from_run_config(run_config)
     model = p3.build_model(model_args).to(device)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     p3.load_model_state_dict(model, checkpoint["model_state_dict"])
 
     thresholds = np.linspace(args.threshold_min, args.threshold_max, args.threshold_count, dtype=np.float64)
@@ -457,15 +702,21 @@ def main():
         row.update(metrics)
         rows.append(row)
 
-    best_row = choose_best_threshold(rows, args.selection_metric)
+    operating_row, operating_point = choose_operating_point(
+        rows=rows,
+        operating_point_rule=args.operating_point_rule,
+        selection_metric=args.selection_metric,
+        target_fpr=args.target_fpr,
+    )
     configured_row = find_closest_threshold_row(rows, configured_threshold)
 
+    selection_label = operating_point["rule"]
     p3.save_json(output_dir / "threshold_metrics.json", rows)
     save_threshold_sweep_plot(
         rows=rows,
         output_path=output_dir / "threshold_sweep.png",
-        best_threshold=float(best_row["threshold"]),
-        selection_metric=args.selection_metric,
+        best_threshold=float(operating_row["threshold"]),
+        selection_label=selection_label,
         configured_threshold=configured_threshold,
     )
 
@@ -476,10 +727,10 @@ def main():
             images=positive_preview["images"],
             masks=positive_preview["masks"],
             logits=positive_preview["logits"],
-            output_path=output_dir / "best_threshold_positive_preview.png",
+            output_path=output_dir / "selected_threshold_positive_preview.png",
             mean=mean,
             std=std,
-            threshold=float(best_row["threshold"]),
+            threshold=float(operating_row["threshold"]),
             indices=positive_preview["indices"],
         )
     if negative_preview is not None:
@@ -487,12 +738,58 @@ def main():
             images=negative_preview["images"],
             masks=negative_preview["masks"],
             logits=negative_preview["logits"],
-            output_path=output_dir / "best_threshold_negative_preview.png",
+            output_path=output_dir / "selected_threshold_negative_preview.png",
             mean=mean,
             std=std,
-            threshold=float(best_row["threshold"]),
+            threshold=float(operating_row["threshold"]),
             indices=negative_preview["indices"],
         )
+
+    glon_lookup = load_metadata_array(data_h5, "glon_deg", dtype=np.float32)
+    glat_lookup = load_metadata_array(data_h5, "glat_deg", dtype=np.float32)
+    provenance_lookup = {
+        "coord_pool_idx": load_optional_metadata_array(data_h5, "coord_pool_idx", dtype=np.int32, default_value=-1),
+        "coord_mask_fraction": load_optional_metadata_array(
+            data_h5,
+            "coord_mask_fraction",
+            dtype=np.float32,
+            default_value=np.nan,
+        ),
+        "cmb_realization_idx": load_metadata_array(data_h5, "cmb_realization_idx", dtype=np.int32),
+        "background_id": load_optional_metadata_array(data_h5, "background_id", dtype=np.uint64, default_value=0),
+    }
+    truth_lookup = {
+        "has_signal": load_truth_array(data_h5, "has_signal", dtype=np.uint8),
+        "theta_crit_deg": load_truth_array(data_h5, "theta_crit_deg", dtype=np.float32),
+        "z0": load_truth_array(data_h5, "z0", dtype=np.float32),
+        "zcrit": load_truth_array(data_h5, "zcrit", dtype=np.float32),
+        "edge_sigma_deg": load_truth_array(data_h5, "edge_sigma_deg", dtype=np.float32),
+        "signal_center_dx_deg": load_truth_array(data_h5, "signal_center_dx_deg", dtype=np.float32),
+        "signal_center_dy_deg": load_truth_array(data_h5, "signal_center_dy_deg", dtype=np.float32),
+    }
+
+    artifact_loader = p3.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
+    )
+    artifact_bundle = collect_prediction_artifacts(
+        model=model,
+        loader=artifact_loader,
+        device=device,
+        threshold=float(operating_row["threshold"]),
+        preview_count=args.preview_count,
+        glon_lookup=glon_lookup,
+        glat_lookup=glat_lookup,
+        provenance_lookup=provenance_lookup,
+        truth_lookup=truth_lookup,
+    )
+    stratified_metrics = make_stratified_metrics(data_h5=data_h5, artifact_bundle=artifact_bundle)
+    p3.save_json(output_dir / "stratified_metrics.json", stratified_metrics)
+    candidate_records_path, candidate_masks_path = save_candidate_outputs(output_dir, artifact_bundle)
 
     summary = {
         "run_dir": str(run_dir),
@@ -500,36 +797,47 @@ def main():
         "checkpoint_label": checkpoint_label,
         "split": args.split,
         "num_samples": int(len(split_indices)),
-        "selection_metric": args.selection_metric,
         "configured_threshold": configured_threshold,
-        "best_threshold": float(best_row["threshold"]),
         "configured_threshold_metrics": configured_row,
-        "best_threshold_metrics": best_row,
+        "operating_point": operating_point,
+        "selected_threshold": float(operating_row["threshold"]),
+        "selected_threshold_metrics": operating_row,
         "artifacts": {
             "threshold_metrics_json": str((output_dir / "threshold_metrics.json").resolve()),
             "threshold_sweep_plot": str((output_dir / "threshold_sweep.png").resolve()),
-            "positive_preview": str((output_dir / "best_threshold_positive_preview.png").resolve()),
-            "negative_preview": str((output_dir / "best_threshold_negative_preview.png").resolve()),
+            "positive_preview": str((output_dir / "selected_threshold_positive_preview.png").resolve()),
+            "negative_preview": str((output_dir / "selected_threshold_negative_preview.png").resolve()),
+            "stratified_metrics_json": str((output_dir / "stratified_metrics.json").resolve()),
+            "candidate_records_jsonl": str(candidate_records_path.resolve()),
+            "candidate_masks_npz": str(candidate_masks_path.resolve()),
         },
     }
     p3.save_json(output_dir / "evaluation_summary.json", summary)
+
+    output_audit = run_output_audit(output_dir)
+    p3.save_json(output_dir / "output_audit.json", output_audit)
+    if output_audit["status"] != "pass":
+        raise RuntimeError(f"Evaluation outputs failed audit. See {output_dir / 'output_audit.json'}")
 
     print("\n=== Phase 3 evaluation summary ===")
     print(f"  Run dir:                {run_dir}")
     print(f"  Checkpoint:             {checkpoint_path}")
     print(f"  Split:                  {args.split} ({len(split_indices)} samples)")
     print(f"  Configured threshold:   {configured_threshold:.3f}")
+    print(f"  Operating-point rule:   {operating_point['rule']}")
+    if "target_fpr" in operating_point:
+        print(f"  Target image FPR:       {operating_point['target_fpr']:.3f}")
+    print(f"  Selected threshold:     {operating_row['threshold']:.3f}")
     print(
-        f"  Best threshold ({args.selection_metric}): "
-        f"{best_row['threshold']:.3f}"
-    )
-    print(
-        f"  Best image F1:          {best_row['image_f1']:.3f} "
-        f"(precision={best_row['image_precision']:.3f}, "
-        f"recall={best_row['image_recall']:.3f}, "
-        f"fpr={best_row['image_false_positive_rate']:.3f})"
+        f"  Selected image F1:      {operating_row['image_f1']:.3f} "
+        f"(precision={operating_row['image_precision']:.3f}, "
+        f"recall={operating_row['image_recall']:.3f}, "
+        f"fpr={operating_row['image_false_positive_rate']:.3f})"
     )
     print(f"  Threshold sweep plot:   {output_dir / 'threshold_sweep.png'}")
+    print(f"  Stratified metrics:     {output_dir / 'stratified_metrics.json'}")
+    print(f"  Candidate records:      {candidate_records_path}")
+    print(f"  Output audit:           {output_dir / 'output_audit.json'}")
     print(f"  Evaluation summary:     {output_dir / 'evaluation_summary.json'}")
 
 

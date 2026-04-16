@@ -31,17 +31,21 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.ndimage import shift as ndi_shift
+from phase2_audit_dataset import run_audit
+from phase_dataset_utils import load_predefined_split_indices, load_signal_strength
 
 try:
     import torch
     import torch.nn as nn
-    from torch.utils.data import DataLoader, Dataset
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 except Exception as exc:  # pragma: no cover - handled at runtime
     torch = None
     nn = None
+    F = None
     DataLoader = None
     Dataset = object
+    WeightedRandomSampler = None
     TORCH_IMPORT_ERROR = exc
 else:
     TORCH_IMPORT_ERROR = None
@@ -55,7 +59,7 @@ else:
     SMP_IMPORT_ERROR = None
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATA_H5 = PROJECT_ROOT / "data" / "training_v2_fixed_10000" / "training_data.h5"
+DEFAULT_DATA_H5 = PROJECT_ROOT / "data" / "training_v4" / "training_data.h5"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "runs" / "phase3_unet"
 EPS = 1e-6
 
@@ -72,15 +76,77 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default="plateau",
+        choices=["plateau", "cosine"],
+        help="Learning-rate scheduler. Use cosine for short fixed-length fine-tunes.",
+    )
     parser.add_argument("--train-fraction", type=float, default=0.9)
+    parser.add_argument(
+        "--split-source",
+        type=str,
+        default="auto",
+        choices=["auto", "predefined", "random"],
+        help="Use dataset-provided split indices when available, or force a random split for older datasets.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--min-positive-amplitude", type=float, default=0.0)
     parser.add_argument("--encoder-name", type=str, default="efficientnet-b0")
     parser.add_argument("--encoder-weights", type=str, default="imagenet")
+    parser.add_argument(
+        "--extra-channel-dataset",
+        action="append",
+        default=[],
+        help=(
+            "Optional HDF5 dataset path to append as an input channel, e.g. "
+            "`features/matched_filter_response`. Can be repeated."
+        ),
+    )
     parser.add_argument("--bce-weight", type=float, default=1.0)
     parser.add_argument("--dice-weight", type=float, default=1.0)
-    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--aux-head-weight",
+        type=float,
+        default=0.0,
+        help="Joint image-level presence loss weight. Uses segmentation_models_pytorch aux_params when > 0.",
+    )
+    parser.add_argument("--aux-head-dropout", type=float, default=0.2)
+    parser.add_argument(
+        "--boundary-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Extra BCE pixel weight applied inside a narrow band around the target causal boundary. "
+            "The segmentation target remains the full causal disc; this only emphasizes boundary pixels."
+        ),
+    )
+    parser.add_argument(
+        "--boundary-width-pixels",
+        type=int,
+        default=5,
+        help="Half-width, in patch pixels, of the target-boundary emphasis band when --boundary-weight > 0.",
+    )
+    parser.add_argument(
+        "--hard-positive-mining-json",
+        type=str,
+        default="",
+        help="Optional phase3_error_mining.py JSON used to upweight documented hard positive bins.",
+    )
+    parser.add_argument(
+        "--hard-positive-weight",
+        type=float,
+        default=1.0,
+        help="Sampling weight multiplier for hard-positive bins when --hard-positive-mining-json is set.",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Monitoring threshold used for training-time metrics and preview panels. Deployment thresholds are chosen later.",
+    )
     parser.add_argument("--preview-count", type=int, default=6)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument(
@@ -91,14 +157,56 @@ def parse_args():
     )
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-val-samples", type=int, default=0)
+    parser.add_argument(
+        "--normalization-config",
+        type=str,
+        default="",
+        help="Optional previous run_config.json to reuse train normalization and positive-pixel statistics.",
+    )
     parser.add_argument("--grad-clip", type=float, default=0.0)
     parser.add_argument("--max-translate-pixels", type=int, default=48)
+    parser.add_argument(
+        "--checkpoint-metric",
+        type=str,
+        default="image_f1",
+        choices=["image_f1", "hard_dice_pos", "iou_pos", "image_recall"],
+        help="Validation metric used for LR scheduling and best-checkpoint selection.",
+    )
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=str,
+        default="",
+        help="Optional checkpoint path to resume model, optimizer, scheduler, scaler, and history.",
+    )
+    parser.add_argument(
+        "--model-only-resume",
+        action="store_true",
+        help=(
+            "When --resume-checkpoint is provided, load only compatible model weights and reset "
+            "optimizer/scheduler/history. Use this for controlled fine-tune ablations."
+        ),
+    )
+    parser.add_argument(
+        "--cache-data",
+        action="store_true",
+        help="Load selected patches/masks into RAM once to avoid repeated HDF5 reads during training.",
+    )
     parser.add_argument("--disable-amp", action="store_true")
     parser.add_argument("--disable-augment", action="store_true")
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Inspect the dataset, compute normalization statistics, and exit before importing the model.",
+    )
+    parser.add_argument(
+        "--skip-data-audit",
+        action="store_true",
+        help="Skip the strict Phase 2 dataset audit before training. Intended only for debugging.",
+    )
+    parser.add_argument(
+        "--allow-legacy-data",
+        action="store_true",
+        help="Convert dataset-audit failures to warnings. Do not use for production results.",
     )
     return parser.parse_args()
 
@@ -129,6 +237,18 @@ def validate_args(args):
         raise ValueError("--max-translate-pixels must be non-negative.")
     if args.min_positive_amplitude < 0.0:
         raise ValueError("--min-positive-amplitude must be non-negative.")
+    if args.boundary_weight < 0.0:
+        raise ValueError("--boundary-weight must be non-negative.")
+    if args.boundary_width_pixels < 0:
+        raise ValueError("--boundary-width-pixels must be non-negative.")
+    if args.aux_head_weight < 0.0:
+        raise ValueError("--aux-head-weight must be non-negative.")
+    if not (0.0 <= args.aux_head_dropout < 1.0):
+        raise ValueError("--aux-head-dropout must be in [0, 1).")
+    if args.hard_positive_weight < 1.0:
+        raise ValueError("--hard-positive-weight must be >= 1.")
+    if len(parse_extra_channel_datasets(args.extra_channel_dataset)) != len(set(parse_extra_channel_datasets(args.extra_channel_dataset))):
+        raise ValueError("--extra-channel-dataset contains duplicate dataset paths.")
     if args.gpu_ids.strip():
         try:
             parse_gpu_ids(args.gpu_ids)
@@ -181,10 +301,82 @@ def load_labels(h5_path):
 
 
 def load_positive_signal_strength(h5_path):
-    with h5py.File(h5_path, "r") as h5:
-        z0 = np.asarray(h5["metadata"]["z0"][:], dtype=np.float32)
-        zcrit = np.asarray(h5["metadata"]["zcrit"][:], dtype=np.float32)
-    return np.maximum(np.abs(z0), np.abs(zcrit))
+    return load_signal_strength(h5_path)
+
+
+def parse_extra_channel_datasets(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values = [value]
+    else:
+        values = list(value)
+    out = []
+    for item in values:
+        for token in str(item).split(","):
+            token = token.strip().strip("/")
+            if token:
+                out.append(token)
+    return out
+
+
+def input_channel_count_from_args(args):
+    explicit = getattr(args, "input_channels", None)
+    if explicit is not None:
+        return int(explicit)
+    return 1 + len(parse_extra_channel_datasets(getattr(args, "extra_channel_dataset", [])))
+
+
+def input_config_from_run_config(run_config):
+    train_args = run_config.get("args", {})
+    normalization = run_config.get("normalization", {})
+    extra_channel_datasets = parse_extra_channel_datasets(train_args.get("extra_channel_dataset", []))
+    input_channels = int(train_args.get("input_channels", 1 + len(extra_channel_datasets)))
+    channel_means = normalization.get("channel_means")
+    channel_stds = normalization.get("channel_stds")
+    if channel_means is None:
+        channel_means = [float(normalization["train_mean"])] + [0.0] * len(extra_channel_datasets)
+    if channel_stds is None:
+        channel_stds = [float(normalization["train_std"])] + [1.0] * len(extra_channel_datasets)
+    return {
+        "extra_channel_datasets": extra_channel_datasets,
+        "input_channels": input_channels,
+        "channel_means": [float(x) for x in channel_means],
+        "channel_stds": [float(x) for x in channel_stds],
+    }
+
+
+def model_args_from_run_config(run_config):
+    train_args = run_config["args"]
+    input_config = input_config_from_run_config(run_config)
+    return argparse.Namespace(
+        encoder_name=train_args["encoder_name"],
+        encoder_weights=train_args["encoder_weights"],
+        aux_head_weight=float(train_args.get("aux_head_weight", 0.0) or 0.0),
+        aux_head_dropout=float(train_args.get("aux_head_dropout", 0.0) or 0.0),
+        input_channels=input_config["input_channels"],
+        extra_channel_dataset=input_config["extra_channel_datasets"],
+    )
+
+
+def dataset_kwargs_from_run_config(run_config):
+    normalization = run_config["normalization"]
+    input_config = input_config_from_run_config(run_config)
+    return {
+        "mean": float(normalization["train_mean"]),
+        "std": float(normalization["train_std"]),
+        "extra_channel_datasets": input_config["extra_channel_datasets"],
+        "channel_means": input_config["channel_means"],
+        "channel_stds": input_config["channel_stds"],
+    }
+
+
+def h5_dataset_exists(h5, dataset_path):
+    try:
+        obj = h5[dataset_path]
+    except KeyError:
+        return False
+    return isinstance(obj, h5py.Dataset)
 
 
 def format_seconds(seconds):
@@ -248,19 +440,24 @@ def limit_indices(indices, labels, limit, rng):
     return limited
 
 
-def select_candidate_indices(labels, signal_strength, seed, min_positive_amplitude):
-    all_indices = np.arange(len(labels), dtype=np.int64)
+def select_candidate_indices(labels, signal_strength, seed, min_positive_amplitude, base_indices=None):
+    if base_indices is None:
+        all_indices = np.arange(len(labels), dtype=np.int64)
+    else:
+        all_indices = np.asarray(base_indices, dtype=np.int64)
     if min_positive_amplitude <= 0.0:
         return all_indices, {
             "min_positive_amplitude": 0.0,
-            "retained_positive": int((labels == 1).sum()),
-            "retained_negative": int((labels == 0).sum()),
-            "candidate_samples": int(len(labels)),
+            "retained_positive": int((labels[all_indices] == 1).sum()),
+            "retained_negative": int((labels[all_indices] == 0).sum()),
+            "candidate_samples": int(len(all_indices)),
         }
 
     rng = np.random.default_rng(seed)
-    positive_idx = all_indices[(labels == 1) & (signal_strength >= min_positive_amplitude)]
-    negative_idx = all_indices[labels == 0]
+    selected_labels = labels[all_indices]
+    selected_signal = signal_strength[all_indices]
+    positive_idx = all_indices[(selected_labels == 1) & (selected_signal >= min_positive_amplitude)]
+    negative_idx = all_indices[selected_labels == 0]
 
     if len(positive_idx) == 0:
         raise RuntimeError(
@@ -279,6 +476,69 @@ def select_candidate_indices(labels, signal_strength, seed, min_positive_amplitu
         "retained_positive": int(len(positive_idx)),
         "retained_negative": int(len(kept_negatives)),
         "candidate_samples": int(len(candidate_indices)),
+    }
+
+
+def resolve_split_indices(
+    h5_path,
+    labels,
+    signal_strength,
+    train_fraction,
+    seed,
+    min_positive_amplitude,
+    max_train_samples=0,
+    max_val_samples=0,
+    split_source="auto",
+):
+    predefined = None
+    if split_source in {"auto", "predefined"}:
+        predefined = load_predefined_split_indices(h5_path)
+        if split_source == "predefined" and predefined is None:
+            raise RuntimeError("Requested --split-source predefined but the dataset does not provide split indices.")
+
+    if predefined is not None:
+        train_idx, train_summary = select_candidate_indices(
+            labels,
+            signal_strength=signal_strength,
+            seed=seed,
+            min_positive_amplitude=min_positive_amplitude,
+            base_indices=predefined["train_idx"],
+        )
+        val_idx, val_summary = select_candidate_indices(
+            labels,
+            signal_strength=signal_strength,
+            seed=seed + 1,
+            min_positive_amplitude=min_positive_amplitude,
+            base_indices=predefined["val_idx"],
+        )
+        rng = np.random.default_rng(seed)
+        train_idx = limit_indices(train_idx, labels, max_train_samples, rng)
+        val_idx = limit_indices(val_idx, labels, max_val_samples, rng)
+        rng.shuffle(train_idx)
+        rng.shuffle(val_idx)
+        return train_idx, val_idx, {
+            "split_source": "predefined",
+            "train": train_summary,
+            "val": val_summary,
+        }
+
+    candidate_indices, candidate_summary = select_candidate_indices(
+        labels,
+        signal_strength=signal_strength,
+        seed=seed,
+        min_positive_amplitude=min_positive_amplitude,
+    )
+    train_idx, val_idx = stratified_split(
+        labels,
+        train_fraction=train_fraction,
+        seed=seed,
+        max_train_samples=max_train_samples,
+        max_val_samples=max_val_samples,
+        candidate_indices=candidate_indices,
+    )
+    return train_idx, val_idx, {
+        "split_source": "random",
+        "all": candidate_summary,
     }
 
 
@@ -315,7 +575,7 @@ def iter_index_chunks(indices, chunk_size):
         yield np.sort(chunk)
 
 
-def compute_patch_normalization(h5_path, indices, chunk_size=64):
+def compute_patch_normalization(h5_path, indices, chunk_size=256):
     total_sum = 0.0
     total_sq = 0.0
     total_count = 0
@@ -338,7 +598,50 @@ def compute_patch_normalization(h5_path, indices, chunk_size=64):
     return float(mean), float(std)
 
 
-def compute_positive_pixel_fraction(h5_path, indices, chunk_size=128):
+def compute_dataset_normalization(h5_path, indices, dataset_path, label=None, chunk_size=256):
+    total_sum = 0.0
+    total_sq = 0.0
+    total_count = 0
+    progress = ProgressPrinter(len(indices), label or f"Normalization {dataset_path}")
+    processed = 0
+
+    with h5py.File(h5_path, "r") as h5:
+        if not h5_dataset_exists(h5, dataset_path):
+            raise KeyError(f"Normalization dataset not found in {h5_path}: {dataset_path}")
+        dataset = h5[dataset_path]
+        if dataset.shape[0] != h5["labels"].shape[0]:
+            raise RuntimeError(f"Dataset {dataset_path} has incompatible leading dimension: {dataset.shape}")
+        for chunk in iter_index_chunks(indices, chunk_size):
+            batch = np.asarray(dataset[chunk], dtype=np.float64)
+            total_sum += float(batch.sum())
+            total_sq += float(np.square(batch).sum())
+            total_count += int(batch.size)
+            processed += len(chunk)
+            progress.update(processed)
+
+    mean = total_sum / max(total_count, 1)
+    variance = max(total_sq / max(total_count, 1) - mean**2, 1e-12)
+    std = math.sqrt(variance)
+    return float(mean), float(std)
+
+
+def compute_extra_channel_normalization(h5_path, indices, extra_channel_datasets, chunk_size=256):
+    means = []
+    stds = []
+    for dataset_path in extra_channel_datasets:
+        mean, std = compute_dataset_normalization(
+            h5_path,
+            indices,
+            dataset_path=dataset_path,
+            label=f"Normalization {dataset_path}",
+            chunk_size=chunk_size,
+        )
+        means.append(mean)
+        stds.append(std)
+    return means, stds
+
+
+def compute_positive_pixel_fraction(h5_path, indices, chunk_size=256):
     total_positive = 0.0
     total_pixels = 0
     progress = ProgressPrinter(len(indices), "Mask stats")
@@ -373,13 +676,13 @@ def count_class_balance(labels, indices):
 def random_dihedral(patch, mask, rng):
     k = int(rng.integers(0, 4))
     if k:
-        patch = np.rot90(patch, k=k)
+        patch = np.rot90(patch, k=k, axes=(-2, -1))
         mask = np.rot90(mask, k=k)
     if rng.random() < 0.5:
-        patch = np.flip(patch, axis=0)
+        patch = np.flip(patch, axis=-2)
         mask = np.flip(mask, axis=0)
     if rng.random() < 0.5:
-        patch = np.flip(patch, axis=1)
+        patch = np.flip(patch, axis=-1)
         mask = np.flip(mask, axis=1)
     return patch.copy(), mask.copy()
 
@@ -390,26 +693,44 @@ def translate_patch_and_mask(patch, mask, shift_y, shift_x):
     memorizing that positive masks are always centered in the patch.
 
     We reflect-pad the CMB patch to avoid introducing artificial blank borders,
-    while the binary target mask is shifted with zero fill.
+    while the binary target mask is shifted with zero fill. Shifts are integer
+    pixels, so direct slicing is much faster than scipy.ndimage.shift and avoids
+    interpolation artifacts.
     """
     if shift_x == 0 and shift_y == 0:
         return patch, mask
 
-    patch_shifted = ndi_shift(
-        patch,
-        shift=(shift_y, shift_x),
-        order=1,
-        mode="reflect",
-        prefilter=False,
-    )
-    mask_shifted = ndi_shift(
-        mask,
-        shift=(shift_y, shift_x),
-        order=0,
-        mode="constant",
-        cval=0.0,
-        prefilter=False,
-    )
+    h, w = patch.shape[-2:]
+    pad_y = abs(int(shift_y))
+    pad_x = abs(int(shift_x))
+
+    if patch.ndim == 2:
+        pad_width = ((pad_y, pad_y), (pad_x, pad_x))
+        patch_y_slice = slice(pad_y - int(shift_y), pad_y - int(shift_y) + h)
+        patch_x_slice = slice(pad_x - int(shift_x), pad_x - int(shift_x) + w)
+        patch_padded = np.pad(patch, pad_width, mode="reflect")
+        patch_shifted = patch_padded[patch_y_slice, patch_x_slice]
+    elif patch.ndim == 3:
+        pad_width = ((0, 0), (pad_y, pad_y), (pad_x, pad_x))
+        patch_y_slice = slice(pad_y - int(shift_y), pad_y - int(shift_y) + h)
+        patch_x_slice = slice(pad_x - int(shift_x), pad_x - int(shift_x) + w)
+        patch_padded = np.pad(patch, pad_width, mode="reflect")
+        patch_shifted = patch_padded[:, patch_y_slice, patch_x_slice]
+    else:
+        raise ValueError(f"Expected 2D or 3D patch array, got shape {patch.shape}.")
+
+    mask_shifted = np.zeros_like(mask, dtype=np.float32)
+    src_y0 = max(0, -int(shift_y))
+    src_y1 = min(h, h - int(shift_y))
+    dst_y0 = max(0, int(shift_y))
+    dst_y1 = min(h, h + int(shift_y))
+    src_x0 = max(0, -int(shift_x))
+    src_x1 = min(w, w - int(shift_x))
+    dst_x0 = max(0, int(shift_x))
+    dst_x1 = min(w, w + int(shift_x))
+    if src_y1 > src_y0 and src_x1 > src_x0:
+        mask_shifted[dst_y0:dst_y1, dst_x0:dst_x1] = mask[src_y0:src_y1, src_x0:src_x1]
+
     return patch_shifted.astype(np.float32), (mask_shifted > 0.5).astype(np.float32)
 
 
@@ -417,22 +738,87 @@ def random_translate(patch, mask, rng, max_translate_pixels):
     if max_translate_pixels <= 0:
         return patch, mask
 
-    shift_y = int(rng.integers(-max_translate_pixels, max_translate_pixels + 1))
-    shift_x = int(rng.integers(-max_translate_pixels, max_translate_pixels + 1))
+    positive = mask > 0.5
+    if np.any(positive):
+        ys, xs = np.nonzero(positive)
+        max_up = min(int(max_translate_pixels), int(ys.min()))
+        max_down = min(int(max_translate_pixels), int(mask.shape[0] - 1 - ys.max()))
+        max_left = min(int(max_translate_pixels), int(xs.min()))
+        max_right = min(int(max_translate_pixels), int(mask.shape[1] - 1 - xs.max()))
+        shift_y = int(rng.integers(-max_up, max_down + 1))
+        shift_x = int(rng.integers(-max_left, max_right + 1))
+    else:
+        shift_y = int(rng.integers(-max_translate_pixels, max_translate_pixels + 1))
+        shift_x = int(rng.integers(-max_translate_pixels, max_translate_pixels + 1))
     return translate_patch_and_mask(patch, mask, shift_y=shift_y, shift_x=shift_x)
 
 
+def read_h5_rows(dataset, indices):
+    indices = np.asarray(indices, dtype=np.int64)
+    if indices.size == 0:
+        return np.empty((0, *dataset.shape[1:]), dtype=dataset.dtype)
+    order = np.argsort(indices)
+    sorted_indices = indices[order]
+    values_sorted = np.asarray(dataset[sorted_indices])
+    inverse = np.empty_like(order)
+    inverse[order] = np.arange(order.size)
+    return values_sorted[inverse]
+
+
 class H5BubbleDataset(Dataset):
-    def __init__(self, h5_path, indices, mean, std, augment=False, seed=42, max_translate_pixels=0):
+    def __init__(
+        self,
+        h5_path,
+        indices,
+        mean,
+        std,
+        augment=False,
+        seed=42,
+        max_translate_pixels=0,
+        cache_data=False,
+        extra_channel_datasets=None,
+        channel_means=None,
+        channel_stds=None,
+    ):
         self.h5_path = str(h5_path)
         self.indices = np.asarray(indices, dtype=np.int64)
-        self.mean = float(mean)
-        self.std = float(max(std, 1e-8))
+        self.extra_channel_datasets = parse_extra_channel_datasets(extra_channel_datasets)
+        self.num_channels = 1 + len(self.extra_channel_datasets)
+        if channel_means is None:
+            channel_means = [float(mean)] + [0.0] * len(self.extra_channel_datasets)
+        if channel_stds is None:
+            channel_stds = [float(max(std, 1e-8))] + [1.0] * len(self.extra_channel_datasets)
+        self.channel_means = np.asarray(channel_means, dtype=np.float32)
+        self.channel_stds = np.maximum(np.asarray(channel_stds, dtype=np.float32), 1e-8)
+        if self.channel_means.size != self.num_channels or self.channel_stds.size != self.num_channels:
+            raise ValueError(
+                f"Expected {self.num_channels} channel normalization values, got "
+                f"{self.channel_means.size} means and {self.channel_stds.size} stds."
+            )
+        self.mean = float(self.channel_means[0])
+        self.std = float(self.channel_stds[0])
         self.augment = bool(augment)
         self.seed = int(seed)
         self.max_translate_pixels = int(max_translate_pixels)
+        self.cache_data = bool(cache_data)
         self._h5 = None
         self._rng = None
+        self._patches = None
+        self._extra_channels = None
+        self._masks = None
+        self._labels = None
+        if self.cache_data:
+            with h5py.File(self.h5_path, "r") as h5:
+                for dataset_path in self.extra_channel_datasets:
+                    if not h5_dataset_exists(h5, dataset_path):
+                        raise KeyError(f"Extra input channel dataset not found in {self.h5_path}: {dataset_path}")
+                self._patches = read_h5_rows(h5["patches"], self.indices).astype(np.float32, copy=False)
+                self._extra_channels = [
+                    read_h5_rows(h5[dataset_path], self.indices).astype(np.float32, copy=False)
+                    for dataset_path in self.extra_channel_datasets
+                ]
+                self._masks = read_h5_rows(h5["masks"], self.indices).astype(np.float32, copy=False)
+                self._labels = read_h5_rows(h5["labels"], self.indices).astype(np.float32, copy=False)
 
     def __len__(self):
         return len(self.indices)
@@ -453,11 +839,30 @@ class H5BubbleDataset(Dataset):
         return self._rng
 
     def __getitem__(self, item):
-        h5 = self._get_h5()
         index = int(self.indices[item])
+        if self.cache_data:
+            patch = np.asarray(self._patches[item], dtype=np.float32)
+            extra_channels = [
+                np.asarray(channel[item], dtype=np.float32)
+                for channel in (self._extra_channels or [])
+            ]
+            mask = np.asarray(self._masks[item], dtype=np.float32)
+            label = float(self._labels[item])
+        else:
+            h5 = self._get_h5()
+            for dataset_path in self.extra_channel_datasets:
+                if not h5_dataset_exists(h5, dataset_path):
+                    raise KeyError(f"Extra input channel dataset not found in {self.h5_path}: {dataset_path}")
+            patch = np.asarray(h5["patches"][index], dtype=np.float32)
+            extra_channels = [
+                np.asarray(h5[dataset_path][index], dtype=np.float32)
+                for dataset_path in self.extra_channel_datasets
+            ]
+            mask = np.asarray(h5["masks"][index], dtype=np.float32)
+            label = float(h5["labels"][index])
 
-        patch = np.asarray(h5["patches"][index], dtype=np.float32)
-        mask = np.asarray(h5["masks"][index], dtype=np.float32)
+        if extra_channels:
+            patch = np.stack([patch, *extra_channels], axis=0).astype(np.float32, copy=False)
 
         if self.augment:
             patch, mask = random_translate(
@@ -468,13 +873,15 @@ class H5BubbleDataset(Dataset):
             )
             patch, mask = random_dihedral(patch, mask, self._get_rng())
 
-        patch = (patch - self.mean) / self.std
-        patch = patch[None, :, :]
+        if patch.ndim == 2:
+            patch = patch[None, :, :]
+        patch = (patch - self.channel_means[:, None, None]) / self.channel_stds[:, None, None]
         mask = mask[None, :, :]
 
         return {
             "image": torch.from_numpy(patch),
             "mask": torch.from_numpy(mask),
+            "label": torch.tensor(label, dtype=torch.float32),
             "index": index,
         }
 
@@ -539,31 +946,53 @@ def model_state_dict_for_checkpoint(model):
     return model.state_dict()
 
 
-def load_model_state_dict(model, state_dict):
+def load_model_state_dict(model, state_dict, strict=True):
     try:
-        model.load_state_dict(state_dict)
+        model.load_state_dict(state_dict, strict=strict)
         return
     except RuntimeError:
         pass
 
+    if isinstance(model, nn.DataParallel):
+        prefixed = {}
+        for key, value in state_dict.items():
+            prefixed[key if key.startswith("module.") else f"module.{key}"] = value
+        model.load_state_dict(prefixed, strict=strict)
+        return
+
     stripped = {}
     for key, value in state_dict.items():
-        if key.startswith("module."):
-            stripped[key[len("module."):]] = value
-        else:
-            stripped[key] = value
-    model.load_state_dict(stripped)
+        stripped[key[len("module."):] if key.startswith("module.") else key] = value
+    model.load_state_dict(stripped, strict=strict)
 
 
 def build_model(args):
     encoder_weights = None if args.encoder_weights.lower() == "none" else args.encoder_weights
+    input_channels = input_channel_count_from_args(args)
+    aux_params = None
+    if getattr(args, "aux_head_weight", 0.0) > 0.0:
+        aux_params = {
+            "pooling": "avg",
+            "dropout": float(args.aux_head_dropout),
+            "activation": None,
+            "classes": 1,
+        }
     return smp.Unet(
         encoder_name=args.encoder_name,
         encoder_weights=encoder_weights,
-        in_channels=1,
+        in_channels=input_channels,
         classes=1,
         activation=None,
+        aux_params=aux_params,
     )
+
+
+def unpack_model_output(output):
+    if isinstance(output, (tuple, list)):
+        mask_logits = output[0]
+        image_logits = output[1] if len(output) > 1 else None
+        return mask_logits, image_logits
+    return output, None
 
 
 def dice_loss_from_logits(logits, targets):
@@ -573,6 +1002,31 @@ def dice_loss_from_logits(logits, targets):
     denominator = probs.sum(dim=dims) + targets.sum(dim=dims)
     dice = (2.0 * intersection + EPS) / (denominator + EPS)
     return 1.0 - dice.mean()
+
+
+def target_boundary_band(targets, width_pixels):
+    if width_pixels <= 0:
+        return torch.zeros_like(targets)
+
+    kernel_size = 2 * int(width_pixels) + 1
+    padding = int(width_pixels)
+    dilated = F.max_pool2d(targets, kernel_size=kernel_size, stride=1, padding=padding)
+    eroded = 1.0 - F.max_pool2d(1.0 - targets, kernel_size=kernel_size, stride=1, padding=padding)
+    return (dilated - eroded).clamp_(0.0, 1.0)
+
+
+def weighted_bce_with_logits(logits, targets, base_pos_weight, boundary_weight, boundary_width_pixels):
+    if boundary_weight <= 0.0 or boundary_width_pixels <= 0:
+        return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=base_pos_weight)
+
+    boundary = target_boundary_band(targets, boundary_width_pixels)
+    pixel_weights = 1.0 + float(boundary_weight) * boundary
+    return F.binary_cross_entropy_with_logits(
+        logits,
+        targets,
+        weight=pixel_weights,
+        pos_weight=base_pos_weight,
+    )
 
 
 def batch_metrics_from_logits(logits, targets, threshold):
@@ -653,6 +1107,50 @@ def update_metric_accumulator(acc, batch_size, loss_value, bce_value, dice_loss_
     acc["image_tn"] += metrics["image_tn"]
 
 
+def build_hard_positive_sample_weights(h5_path, train_idx, error_mining_json, hard_positive_weight):
+    if not error_mining_json:
+        return None, {}
+
+    report = load_json(error_mining_json)
+    hard_samples = set()
+    selected_groups = ("amplitude", "edge_strength", "theta_crit", "offcenter_distance", "local_background_std")
+    for group_name in selected_groups:
+        for _, row in report.get("groups", {}).get(group_name, {}).items():
+            if float(row.get("recall", 1.0)) <= 0.40:
+                hard_samples.update(int(x) for x in row.get("sample_misses", []))
+
+    with h5py.File(h5_path, "r") as h5:
+        labels = read_h5_rows(h5["labels"], train_idx).astype(np.uint8, copy=False)
+        truth = h5["truth"]
+        theta = read_h5_rows(truth["theta_crit_deg"], train_idx).astype(np.float32, copy=False)
+        z0 = read_h5_rows(truth["z0"], train_idx).astype(np.float32, copy=False)
+        zcrit = read_h5_rows(truth["zcrit"], train_idx).astype(np.float32, copy=False)
+        dx = read_h5_rows(truth["signal_center_dx_deg"], train_idx).astype(np.float32, copy=False)
+        dy = read_h5_rows(truth["signal_center_dy_deg"], train_idx).astype(np.float32, copy=False)
+
+    amplitude = np.maximum(np.abs(z0), np.abs(zcrit))
+    offset = np.hypot(dx, dy)
+    hard_mask = (labels == 1) & (
+        (amplitude < 3e-5)
+        | (np.abs(zcrit) < 3e-5)
+        | (theta < 15.0)
+        | (offset >= 10.0)
+    )
+    weights = np.ones(len(train_idx), dtype=np.float64)
+    weights[hard_mask] = float(hard_positive_weight)
+
+    return weights, {
+        "source": str(Path(error_mining_json).resolve()),
+        "hard_positive_weight": float(hard_positive_weight),
+        "candidate_hard_samples": int(len(hard_samples)),
+        "train_hard_samples": int(hard_mask.sum()),
+        "selection_rule": (
+            "upweight train positives in documented weak families: amplitude < 3e-5, "
+            "|zcrit| < 3e-5, theta_crit < 15 deg, or off-center distance >= 10 deg"
+        ),
+    }
+
+
 def finalize_metrics(acc):
     n = max(acc["num_samples"], 1)
     pos_n = max(acc["num_positive_samples"], 1)
@@ -686,7 +1184,12 @@ def finalize_metrics(acc):
 
 
 def save_prediction_preview(images, masks, logits, output_path, mean, std, threshold, indices):
-    probs = 1.0 / (1.0 + np.exp(-logits))
+    logits = np.asarray(logits, dtype=np.float32)
+    probs = np.empty_like(logits, dtype=np.float32)
+    positive = logits >= 0.0
+    probs[positive] = 1.0 / (1.0 + np.exp(-logits[positive]))
+    exp_logits = np.exp(logits[~positive])
+    probs[~positive] = exp_logits / (1.0 + exp_logits)
     preds = probs >= threshold
     nrows = min(len(images), 6)
     fig, axes = plt.subplots(nrows, 4, figsize=(16, 4 * nrows))
@@ -760,6 +1263,34 @@ def save_json(path, payload):
         json.dump(payload, handle, indent=2)
 
 
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_normalization_config(path):
+    payload = load_json(path)
+    normalization = payload.get("normalization", {})
+    loss_reweighting = payload.get("loss_reweighting", {})
+    required_norm = ("train_mean", "train_std")
+    required_loss = ("positive_pixel_fraction", "bce_pos_weight")
+    missing = [key for key in required_norm if key not in normalization]
+    missing += [key for key in required_loss if key not in loss_reweighting]
+    if missing:
+        raise RuntimeError(f"Normalization config is missing fields: {missing}")
+    result = {
+        "train_mean": float(normalization["train_mean"]),
+        "train_std": float(normalization["train_std"]),
+        "positive_pixel_fraction": float(loss_reweighting["positive_pixel_fraction"]),
+        "bce_pos_weight": float(loss_reweighting["bce_pos_weight"]),
+        "source": str(Path(path).resolve()),
+    }
+    if "channel_means" in normalization and "channel_stds" in normalization:
+        result["channel_means"] = [float(x) for x in normalization["channel_means"]]
+        result["channel_stds"] = [float(x) for x in normalization["channel_stds"]]
+    return result
+
+
 def run_one_epoch(
     model,
     loader,
@@ -770,8 +1301,11 @@ def run_one_epoch(
     threshold,
     bce_weight,
     dice_weight,
+    aux_head_weight,
     use_amp,
     grad_clip,
+    boundary_weight,
+    boundary_width_pixels,
     train_mode,
 ):
     accumulator = make_metric_accumulator()
@@ -790,16 +1324,31 @@ def run_one_epoch(
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
+        labels = batch["label"].to(device, non_blocking=True)
 
         if train_mode:
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(train_mode):
-            with torch.cuda.amp.autocast(enabled=autocast_enabled):
-                logits = model(images)
-                bce = loss_fn(logits, masks)
+            with torch.amp.autocast(device_type=device.type, enabled=autocast_enabled):
+                model_output = model(images)
+                logits, image_logits = unpack_model_output(model_output)
+                if boundary_weight > 0.0 and boundary_width_pixels > 0:
+                    bce = weighted_bce_with_logits(
+                        logits=logits,
+                        targets=masks,
+                        base_pos_weight=loss_fn.pos_weight,
+                        boundary_weight=boundary_weight,
+                        boundary_width_pixels=boundary_width_pixels,
+                    )
+                else:
+                    bce = loss_fn(logits, masks)
                 dice = dice_loss_from_logits(logits, masks)
                 loss = bce_weight * bce + dice_weight * dice
+                if aux_head_weight > 0.0 and image_logits is not None:
+                    image_logits = image_logits.reshape(-1)
+                    image_loss = F.binary_cross_entropy_with_logits(image_logits, labels.float())
+                    loss = loss + float(aux_head_weight) * image_loss
 
             if train_mode:
                 scaler.scale(loss).backward()
@@ -844,29 +1393,85 @@ def main():
         raise FileNotFoundError(f"Dataset not found: {h5_path}")
 
     run_dir = make_run_dir(args.output_root, args.run_name)
+    input_audit_report = None
+    if not args.skip_data_audit:
+        print("\n=== Auditing Phase 2 dataset before training ===")
+        input_audit_report = run_audit(
+            h5_path,
+            allow_legacy=args.allow_legacy_data,
+            sample_patch_count=256,
+        )
+        audit_path = run_dir / "input_dataset_audit.json"
+        save_json(audit_path, input_audit_report)
+        print(f"  Audit status:    {input_audit_report['status']}")
+        print(f"  Audit failures:  {input_audit_report['num_failures']}")
+        print(f"  Audit warnings:  {input_audit_report['num_warnings']}")
+        print(f"  Audit report:    {audit_path}")
+        if input_audit_report["status"] != "pass":
+            raise RuntimeError(f"Input dataset failed audit. See {audit_path}")
+
     summary = load_dataset_summary(h5_path)
     labels = load_labels(h5_path)
     signal_strength = load_positive_signal_strength(h5_path)
-    candidate_indices, candidate_summary = select_candidate_indices(
-        labels,
+    extra_channel_datasets = parse_extra_channel_datasets(args.extra_channel_dataset)
+    args.extra_channel_dataset = extra_channel_datasets
+    args.input_channels = 1 + len(extra_channel_datasets)
+    if extra_channel_datasets:
+        with h5py.File(h5_path, "r") as h5:
+            for dataset_path in extra_channel_datasets:
+                if not h5_dataset_exists(h5, dataset_path):
+                    raise KeyError(f"Extra input channel dataset not found in {h5_path}: {dataset_path}")
+                if h5[dataset_path].shape != h5["patches"].shape:
+                    raise RuntimeError(
+                        f"Extra input channel {dataset_path} shape {h5[dataset_path].shape} "
+                        f"does not match patches shape {h5['patches'].shape}."
+                    )
+    train_idx, val_idx, candidate_summary = resolve_split_indices(
+        h5_path=h5_path,
+        labels=labels,
         signal_strength=signal_strength,
-        seed=args.seed,
-        min_positive_amplitude=args.min_positive_amplitude,
-    )
-    train_idx, val_idx = stratified_split(
-        labels,
         train_fraction=args.train_fraction,
         seed=args.seed,
+        min_positive_amplitude=args.min_positive_amplitude,
         max_train_samples=args.max_train_samples,
         max_val_samples=args.max_val_samples,
-        candidate_indices=candidate_indices,
+        split_source=args.split_source,
     )
 
     train_pos, train_neg = count_class_balance(labels, train_idx)
     val_pos, val_neg = count_class_balance(labels, val_idx)
-    train_mean, train_std = compute_patch_normalization(h5_path, train_idx)
-    positive_fraction = compute_positive_pixel_fraction(h5_path, train_idx)
-    pos_weight = compute_pos_weight(positive_fraction)
+    normalization_source = None
+    channel_means = None
+    channel_stds = None
+    if args.normalization_config:
+        cached_norm = load_normalization_config(args.normalization_config)
+        train_mean = cached_norm["train_mean"]
+        train_std = cached_norm["train_std"]
+        positive_fraction = cached_norm["positive_pixel_fraction"]
+        pos_weight = cached_norm["bce_pos_weight"]
+        normalization_source = cached_norm["source"]
+        if (
+            "channel_means" in cached_norm
+            and len(cached_norm["channel_means"]) == args.input_channels
+            and "channel_stds" in cached_norm
+            and len(cached_norm["channel_stds"]) == args.input_channels
+        ):
+            channel_means = cached_norm["channel_means"]
+            channel_stds = cached_norm["channel_stds"]
+        elif extra_channel_datasets:
+            extra_means, extra_stds = compute_extra_channel_normalization(h5_path, train_idx, extra_channel_datasets)
+            channel_means = [train_mean, *extra_means]
+            channel_stds = [train_std, *extra_stds]
+    else:
+        train_mean, train_std = compute_patch_normalization(h5_path, train_idx)
+        extra_means, extra_stds = compute_extra_channel_normalization(h5_path, train_idx, extra_channel_datasets)
+        channel_means = [train_mean, *extra_means]
+        channel_stds = [train_std, *extra_stds]
+        positive_fraction = compute_positive_pixel_fraction(h5_path, train_idx)
+        pos_weight = compute_pos_weight(positive_fraction)
+    if channel_means is None:
+        channel_means = [train_mean]
+        channel_stds = [train_std]
 
     run_config = {
         "created_utc": dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
@@ -884,31 +1489,75 @@ def main():
         "normalization": {
             "train_mean": train_mean,
             "train_std": train_std,
+            "channel_means": [float(x) for x in channel_means],
+            "channel_stds": [float(x) for x in channel_stds],
+            "source": normalization_source or "computed_from_training_split",
         },
         "loss_reweighting": {
             "positive_pixel_fraction": positive_fraction,
             "bce_pos_weight": pos_weight,
         },
         "candidate_selection": candidate_summary,
+        "input_dataset_audit": input_audit_report,
     }
+    sample_weights = None
+    hard_positive_summary = None
+    if args.hard_positive_mining_json:
+        sample_weights, hard_positive_summary = build_hard_positive_sample_weights(
+            h5_path=h5_path,
+            train_idx=train_idx,
+            error_mining_json=args.hard_positive_mining_json,
+            hard_positive_weight=args.hard_positive_weight,
+        )
+        run_config["hard_positive_mining"] = hard_positive_summary
 
     save_json(run_dir / "run_config.json", run_config)
     np.savez_compressed(run_dir / "split_indices.npz", train_idx=train_idx, val_idx=val_idx)
 
     print("\n=== Phase 3 dataset summary ===")
     print(f"  HDF5:            {h5_path}")
+    print(f"  Split source:    {candidate_summary['split_source']}")
     print(f"  Train samples:   {len(train_idx)} ({train_pos} pos / {train_neg} neg)")
     print(f"  Val samples:     {len(val_idx)} ({val_pos} pos / {val_neg} neg)")
     if args.min_positive_amplitude > 0.0:
-        print(
-            f"  Candidate set:   {candidate_summary['candidate_samples']} "
-            f"({candidate_summary['retained_positive']} pos / {candidate_summary['retained_negative']} neg)"
-        )
+        if candidate_summary["split_source"] == "predefined":
+            train_summary = candidate_summary["train"]
+            val_summary = candidate_summary["val"]
+            print(
+                f"  Train candidate: {train_summary['candidate_samples']} "
+                f"({train_summary['retained_positive']} pos / {train_summary['retained_negative']} neg)"
+            )
+            print(
+                f"  Val candidate:   {val_summary['candidate_samples']} "
+                f"({val_summary['retained_positive']} pos / {val_summary['retained_negative']} neg)"
+            )
+        else:
+            all_summary = candidate_summary["all"]
+            print(
+                f"  Candidate set:   {all_summary['candidate_samples']} "
+                f"({all_summary['retained_positive']} pos / {all_summary['retained_negative']} neg)"
+            )
         print(f"  Min amplitude:   {args.min_positive_amplitude:.2e}")
     print(f"  Train mean:      {train_mean:.6e}")
     print(f"  Train std:       {train_std:.6e}")
+    if extra_channel_datasets:
+        print(f"  Input channels:  {args.input_channels} ({', '.join(['patches', *extra_channel_datasets])})")
+        for idx, (mean_value, std_value) in enumerate(zip(channel_means, channel_stds)):
+            print(f"    Channel {idx}: mean {mean_value:.6e}, std {std_value:.6e}")
+    if normalization_source:
+        print(f"  Norm source:     {normalization_source}")
     print(f"  Positive pixels: {positive_fraction:.3%}")
     print(f"  BCE pos_weight:  {pos_weight:.3f}")
+    if args.boundary_weight > 0.0:
+        print(
+            f"  Boundary loss:   +{args.boundary_weight:.2f}x BCE weight "
+            f"within {args.boundary_width_pixels} px of target edge"
+        )
+    if hard_positive_summary:
+        print(
+            f"  Hard positives:  {hard_positive_summary['train_hard_samples']} train samples "
+            f"weighted x{hard_positive_summary['hard_positive_weight']:.2f}"
+        )
 
     if args.dry_run:
         print(f"  Run dir:         {run_dir}")
@@ -934,6 +1583,10 @@ def main():
         augment=not args.disable_augment,
         seed=args.seed,
         max_translate_pixels=args.max_translate_pixels,
+        cache_data=args.cache_data,
+        extra_channel_datasets=extra_channel_datasets,
+        channel_means=channel_means,
+        channel_stds=channel_stds,
     )
     val_dataset = H5BubbleDataset(
         h5_path=h5_path,
@@ -943,6 +1596,10 @@ def main():
         augment=False,
         seed=args.seed + 1,
         max_translate_pixels=0,
+        cache_data=args.cache_data,
+        extra_channel_datasets=extra_channel_datasets,
+        channel_means=channel_means,
+        channel_stds=channel_stds,
     )
 
     loader_kwargs = {
@@ -951,7 +1608,14 @@ def main():
         "pin_memory": device.type == "cuda",
         "persistent_workers": args.num_workers > 0,
     }
-    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+    sampler = None
+    if sample_weights is not None:
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+    train_loader = DataLoader(train_dataset, shuffle=sampler is None, sampler=sampler, **loader_kwargs)
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
 
     model = build_model(args).to(device)
@@ -961,13 +1625,19 @@ def main():
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=0.5,
-        patience=3,
-    )
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    if args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(int(args.epochs), 1),
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=0.5,
+            patience=3,
+        )
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
     loss_fn = nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor([pos_weight], dtype=torch.float32, device=device)
     )
@@ -975,8 +1645,43 @@ def main():
     history = []
     best_val_score = -float("inf")
     best_epoch = -1
+    start_epoch = 1
 
-    for epoch in range(1, args.epochs + 1):
+    resume_checkpoint_path = None
+    if args.resume_checkpoint:
+        resume_checkpoint_path = Path(args.resume_checkpoint)
+        if not resume_checkpoint_path.is_absolute():
+            resume_checkpoint_path = run_dir / resume_checkpoint_path
+        if not resume_checkpoint_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_checkpoint_path}")
+        resume_checkpoint = torch.load(resume_checkpoint_path, map_location=device, weights_only=False)
+        partial_resume = bool(args.model_only_resume or args.aux_head_weight > 0.0)
+        load_model_state_dict(model, resume_checkpoint["model_state_dict"], strict=not partial_resume)
+        if not partial_resume:
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+            scheduler.load_state_dict(resume_checkpoint["scheduler_state_dict"])
+            scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
+        history = [] if partial_resume else list(resume_checkpoint.get("history", []))
+        start_epoch = 1 if partial_resume else int(resume_checkpoint["epoch"]) + 1
+        for entry in history:
+            score = float(entry["val"].get(args.checkpoint_metric, -float("inf")))
+            if score > best_val_score:
+                best_val_score = score
+                best_epoch = int(entry["epoch"])
+        if not partial_resume and history and int(history[-1]["epoch"]) == int(resume_checkpoint["epoch"]):
+            last_score = float(history[-1]["val"].get(args.checkpoint_metric, -float("inf")))
+            if abs(last_score - best_val_score) <= 1e-12:
+                resume_checkpoint["checkpoint_metric"] = args.checkpoint_metric
+                resume_checkpoint["best_val_score"] = best_val_score
+                resume_checkpoint["best_epoch"] = best_epoch
+                torch.save(resume_checkpoint, run_dir / "best_checkpoint.pt")
+        print(
+            f"  Resumed from:    {resume_checkpoint_path} "
+            f"(next epoch {start_epoch}, best {args.checkpoint_metric}={best_val_score:.4f}"
+            f"{', partial model-only resume' if partial_resume else ''})"
+        )
+
+    for epoch in range(start_epoch, args.epochs + 1):
         train_metrics, _ = run_one_epoch(
             model=model,
             loader=train_loader,
@@ -987,8 +1692,11 @@ def main():
             threshold=args.threshold,
             bce_weight=args.bce_weight,
             dice_weight=args.dice_weight,
+            aux_head_weight=args.aux_head_weight,
             use_amp=use_amp,
             grad_clip=args.grad_clip,
+            boundary_weight=args.boundary_weight,
+            boundary_width_pixels=args.boundary_width_pixels,
             train_mode=True,
         )
 
@@ -1003,13 +1711,20 @@ def main():
                 threshold=args.threshold,
                 bce_weight=args.bce_weight,
                 dice_weight=args.dice_weight,
+                aux_head_weight=args.aux_head_weight,
                 use_amp=use_amp,
                 grad_clip=0.0,
+                boundary_weight=args.boundary_weight,
+                boundary_width_pixels=args.boundary_width_pixels,
                 train_mode=False,
             )
 
         current_lr = float(optimizer.param_groups[0]["lr"])
-        scheduler.step(val_metrics["hard_dice_pos"])
+        checkpoint_score = float(val_metrics[args.checkpoint_metric])
+        if args.scheduler == "cosine":
+            scheduler.step()
+        else:
+            scheduler.step(checkpoint_score)
 
         epoch_record = {
             "epoch": epoch,
@@ -1041,15 +1756,18 @@ def main():
             "scaler_state_dict": scaler.state_dict(),
             "run_config": run_config,
             "history": history,
-            "best_val_hard_dice_pos": best_val_score,
+            "checkpoint_metric": args.checkpoint_metric,
+            "best_val_score": best_val_score,
+            "best_epoch": best_epoch,
         }
         torch.save(checkpoint, run_dir / "last_checkpoint.pt")
 
-        val_score = float(val_metrics["hard_dice_pos"])
+        val_score = checkpoint_score
         if val_score > best_val_score:
             best_val_score = val_score
             best_epoch = epoch
-            checkpoint["best_val_hard_dice_pos"] = best_val_score
+            checkpoint["best_val_score"] = best_val_score
+            checkpoint["best_epoch"] = best_epoch
             torch.save(checkpoint, run_dir / "best_checkpoint.pt")
             save_prediction_preview(
                 images=preview["images"][:preview_count],
@@ -1073,7 +1791,7 @@ def main():
 
     print("\n=== Training complete ===")
     print(f"  Best epoch:                 {best_epoch}")
-    print(f"  Best val positive Dice:     {best_val_score:.4f}")
+    print(f"  Best val {args.checkpoint_metric}:        {best_val_score:.4f}")
     print(f"  Outputs saved under:        {run_dir}")
 
 

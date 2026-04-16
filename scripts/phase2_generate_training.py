@@ -1,22 +1,18 @@
 """
-Phase 2 V3: Generate training data for bubble-collision detection.
+Phase 2 V4: Generate provenance-clean training data for bubble-collision detection.
 
-The training set is built from CAMB realizations, not from the single real SMICA
-sky. This matters because the model should learn the bubble-collision pattern on
-top of generic CMB fluctuations, not overfit to one particular realization of
-the sky. The real Planck mask is still used to choose clean sky coordinates so
-the patch geometry matches the final inference setup on SMICA.
+The generator builds synthetic Planck-era patch observables from three pieces:
+    1. CAMB CMB realizations at the working resolution
+    2. Feeney et al. (2011) Eq. 1 collision templates with Eq. 15 multiplicative injection
+    3. An approximate observing model applied at the patch level
 
-Physics choices:
-    - Feeney et al. (2011) Eq. 1 for the radial collision template
-    - Feeney et al. (2011) Eq. 15 for multiplicative injection
-    - Feeney et al. (2011) Eq. 2 motivation for a sin(theta_crit) size prior
-    - always-on edge smoothing to reflect the paper's discussion that the
-      causal boundary may be smeared on sub-degree scales
-
-Outputs are saved as an HDF5 file plus validation plots so the dataset can be
-checked before moving on to model training.
+This version makes three policy choices explicit:
+    - the training size distribution is an Eq. 2-motivated design choice, not the later inference prior
+    - train/validation splits are created from disjoint coordinate pools and disjoint CMB realizations
+    - the default geometry regime is fully contained signals; truncated signals must be requested explicitly
 """
+
+from __future__ import annotations
 
 import argparse
 import datetime as dt
@@ -27,39 +23,88 @@ import os
 import healpy as hp
 import h5py
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.ndimage import gaussian_filter
 
 from phase1_explore import DATA_DIR, MASK_FILE, MASK_URL, download_file
-from phase2_signal_model import (
-    PATCH_PIX,
-    RESO_ARCMIN,
-    bubble_collision_signal,
-    inject_signal_into_patch,
-    make_angular_distance_grid,
+from phase2_physics_checks import (
+    check_eq1_special_cases,
+    check_multiplicative_injection,
+    check_patch_geometry,
+    check_smooth_window_bounds,
 )
+from phase2_signal_model import PATCH_PIX, RESO_ARCMIN, inject_signal_into_patch
+from phase2_audit_dataset import run_audit
+from phase_dataset_utils import make_angular_distance_grid, patch_center_pixel, stable_group_id
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_OUTPUT_DIR = os.path.join(DATA_DIR, "training_v3")
+DEFAULT_OUTPUT_DIR = os.path.join(DATA_DIR, "training_v4")
 NSIDE_WORKING = 256
 MASK_THRESHOLD = 0.95
+GEOMETRY_MODES = ("contained", "truncated")
+SPLIT_TRAIN = 0
+SPLIT_VAL = 1
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate a CAMB-based training dataset for bubble-collision segmentation.",
+        description="Generate a provenance-clean CAMB-based training dataset for bubble-collision segmentation.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--num-samples", type=int, default=1000)
     parser.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--split-seed", type=int, default=314159)
+    parser.add_argument("--train-fraction", type=float, default=0.9)
     parser.add_argument("--pool-size", type=int, default=5000)
     parser.add_argument("--preview-count", type=int, default=8)
     parser.add_argument("--num-cmb-realizations", type=int, default=192)
     parser.add_argument("--edge-sigma-min-deg", type=float, default=0.3)
     parser.add_argument("--edge-sigma-max-deg", type=float, default=1.0)
-    parser.add_argument("--signal-center-edge-margin-pix", type=float, default=16.0)
+    parser.add_argument("--geometry-mode", type=str, default="contained", choices=GEOMETRY_MODES)
+    parser.add_argument(
+        "--signal-center-edge-margin-pix",
+        type=float,
+        default=16.0,
+        help="Only used when --geometry-mode=truncated.",
+    )
+    parser.add_argument(
+        "--contained-margin-deg",
+        type=float,
+        default=0.5,
+        help="Minimum sky margin between a contained target boundary and the patch edge.",
+    )
+    parser.add_argument(
+        "--beam-fwhm-arcmin",
+        type=float,
+        default=15.0,
+        help="Approximate working-map beam applied after injection and before noise.",
+    )
+    parser.add_argument(
+        "--noise-sigma-uk-arcmin",
+        type=float,
+        default=30.0,
+        help="Approximate white-noise level of the working observable.",
+    )
+    parser.add_argument(
+        "--noise-corr-fwhm-arcmin",
+        type=float,
+        default=0.0,
+        help="Optional Gaussian correlation scale for the noise field. Set 0 for white noise.",
+    )
+    parser.add_argument(
+        "--skip-post-audit",
+        action="store_true",
+        help="Skip the automatic post-generation dataset audit. Intended only for debugging.",
+    )
+    parser.add_argument(
+        "--skip-physics-checks",
+        action="store_true",
+        help="Skip pre-generation signal/injection physics checks. Intended only for debugging.",
+    )
     return parser.parse_args()
 
 
@@ -70,9 +115,13 @@ def ensure_even_sample_count(num_samples):
         raise ValueError("--num-samples must be even so the dataset is exactly 50/50 positive and negative.")
 
 
-def validate_smoothing_args(args):
-    if args.num_cmb_realizations <= 0:
-        raise ValueError("--num-cmb-realizations must be positive.")
+def validate_args(args):
+    if args.num_cmb_realizations <= 1:
+        raise ValueError("--num-cmb-realizations must be at least 2.")
+    if args.pool_size <= 1:
+        raise ValueError("--pool-size must be at least 2.")
+    if not (0.0 < args.train_fraction < 1.0):
+        raise ValueError("--train-fraction must be between 0 and 1.")
     if args.edge_sigma_min_deg < 0.0 or args.edge_sigma_max_deg < 0.0:
         raise ValueError("--edge sigma bounds must be non-negative.")
     if args.edge_sigma_min_deg > args.edge_sigma_max_deg:
@@ -81,6 +130,14 @@ def validate_smoothing_args(args):
         raise ValueError("--signal-center-edge-margin-pix must be non-negative.")
     if args.signal_center_edge_margin_pix >= PATCH_PIX / 2.0:
         raise ValueError("--signal-center-edge-margin-pix must be smaller than half the patch width.")
+    if args.contained_margin_deg < 0.0:
+        raise ValueError("--contained-margin-deg must be non-negative.")
+    if args.beam_fwhm_arcmin < 0.0:
+        raise ValueError("--beam-fwhm-arcmin must be non-negative.")
+    if args.noise_sigma_uk_arcmin < 0.0:
+        raise ValueError("--noise-sigma-uk-arcmin must be non-negative.")
+    if args.noise_corr_fwhm_arcmin < 0.0:
+        raise ValueError("--noise-corr-fwhm-arcmin must be non-negative.")
 
 
 def ensure_planck_inputs():
@@ -92,7 +149,7 @@ def load_mask():
     print("\n=== Loading galactic mask ===")
     ensure_planck_inputs()
 
-    mask = hp.read_map(MASK_FILE, field=0, verbose=False)
+    mask = hp.read_map(MASK_FILE, field=0)
     mask_256 = hp.ud_grade(mask, NSIDE_WORKING)
     mask_256 = np.where(mask_256 > 0.5, 1.0, 0.0)
 
@@ -102,17 +159,6 @@ def load_mask():
 
 
 def planck2018_bestfit_params():
-    """
-    Planck 2018 base-LambdaCDM best-fit values used for CAMB realizations.
-
-    Values correspond to the standard Planck 2018 TT,TE,EE+lowE+lensing fit:
-        ombh2 = 0.02237
-        omch2 = 0.1200
-        H0 = 67.36
-        tau = 0.0544
-        ns = 0.9649
-        ln(1e10 As) = 3.044
-    """
     return {
         "H0": 67.36,
         "ombh2": 0.02237,
@@ -129,8 +175,7 @@ def generate_camb_realizations(num_realizations, rng):
         import camb
     except ImportError as exc:
         raise RuntimeError(
-            "CAMB is required for Phase 2 V3. Install it in the active environment "
-            "before running this script."
+            "CAMB is required for Phase 2 generation. Install it in the active environment before running this script."
         ) from exc
 
     params = planck2018_bestfit_params()
@@ -147,12 +192,7 @@ def generate_camb_realizations(num_realizations, rng):
     pars.set_for_lmax(lmax, lens_potential_accuracy=0)
 
     results = camb.get_results(pars)
-    # synfast expects raw C_ell, not D_ell = l(l+1)C_ell/2pi.
-    cls_tt = results.get_cmb_power_spectra(
-        pars,
-        CMB_unit="K",
-        raw_cl=True,
-    )["lensed_scalar"][:, 0]
+    cls_tt = results.get_cmb_power_spectra(pars, CMB_unit="K", raw_cl=True)["lensed_scalar"][:, 0]
     cls_tt = cls_tt[: lmax + 1]
 
     realizations = np.empty((num_realizations, hp.nside2npix(NSIDE_WORKING)), dtype=np.float32)
@@ -166,7 +206,6 @@ def generate_camb_realizations(num_realizations, rng):
             lmax=lmax,
             new=True,
             pixwin=False,
-            verbose=False,
         ).astype(np.float32)
         if (idx + 1) % 16 == 0 or idx + 1 == num_realizations:
             print(f"  Generated {idx + 1:4d} / {num_realizations} CAMB skies")
@@ -210,6 +249,7 @@ def projected_unmasked_fraction(mask_patch):
 def build_coordinate_pool(mask_256, pool_size, rng, min_unmasked_fraction=MASK_THRESHOLD):
     print("\n=== Building valid coordinate pool ===")
     coords = []
+    mask_fractions = []
     attempts = 0
     max_attempts = max(pool_size * 200, 1000)
 
@@ -220,10 +260,12 @@ def build_coordinate_pool(mask_256, pool_size, rng, min_unmasked_fraction=MASK_T
             continue
 
         mask_patch = project_patch(mask_256, glon_deg, glat_deg)
-        if projected_unmasked_fraction(mask_patch) < min_unmasked_fraction:
+        mask_fraction = projected_unmasked_fraction(mask_patch)
+        if mask_fraction < min_unmasked_fraction:
             continue
 
         coords.append((glon_deg, glat_deg))
+        mask_fractions.append(mask_fraction)
         if len(coords) % 250 == 0 or len(coords) == pool_size:
             print(f"  Accepted {len(coords):4d} / {pool_size} centers after {attempts} attempts")
 
@@ -234,7 +276,20 @@ def build_coordinate_pool(mask_256, pool_size, rng, min_unmasked_fraction=MASK_T
         )
 
     print(f"  Final coordinate pool: {len(coords)} centers")
-    return np.asarray(coords, dtype=np.float32)
+    return np.asarray(coords, dtype=np.float32), np.asarray(mask_fractions, dtype=np.float32)
+
+
+def split_index_pool(num_items, train_fraction, seed):
+    if num_items < 2:
+        raise ValueError("Need at least two items to build a train/validation split.")
+    rng = np.random.default_rng(seed)
+    indices = np.arange(num_items, dtype=np.int64)
+    rng.shuffle(indices)
+    train_count = int(round(num_items * train_fraction))
+    train_count = min(max(train_count, 1), num_items - 1)
+    train_idx = np.sort(indices[:train_count])
+    val_idx = np.sort(indices[train_count:])
+    return train_idx, val_idx
 
 
 def sample_log_uniform(rng, low, high):
@@ -242,7 +297,7 @@ def sample_log_uniform(rng, low, high):
     return float(10.0 ** log_value)
 
 
-def sample_theta_crit_from_sin_prior(rng, low_deg=5.0, high_deg=25.0):
+def sample_theta_crit_from_training_prior(rng, low_deg=5.0, high_deg=25.0):
     low_rad = np.radians(low_deg)
     high_rad = np.radians(high_deg)
     u = rng.uniform()
@@ -267,26 +322,92 @@ def build_balanced_sign_pairs(num_positive, rng):
     return sign_pairs
 
 
-def max_fully_contained_radius_deg():
-    center = (PATCH_PIX - 1) / 2.0
-    axis_offset_rad = np.radians(center * RESO_ARCMIN / 60.0)
-    return float(np.degrees(np.arctan(axis_offset_rad)))
-
-
 def make_disk_mask(theta_grid, theta_crit_deg):
     theta_crit_rad = np.radians(theta_crit_deg)
     return (theta_grid <= theta_crit_rad).astype(np.uint8)
 
 
-def sample_signal_center_pixels(rng, npix, edge_margin_pix):
-    low = float(edge_margin_pix)
-    high = float(npix - 1 - edge_margin_pix)
+def target_touches_patch_edge(mask):
+    mask = np.asarray(mask, dtype=bool)
+    if mask.size == 0:
+        return False
+    return bool(mask[0, :].any() or mask[-1, :].any() or mask[:, 0].any() or mask[:, -1].any())
+
+
+def sample_signal_center_pixels(
+    rng,
+    npix,
+    theta_crit_deg,
+    geometry_mode,
+    edge_margin_pix,
+    contained_margin_deg,
+):
+    if geometry_mode == "truncated":
+        low = float(edge_margin_pix)
+        high = float(npix - 1 - edge_margin_pix)
+    else:
+        contained_margin_pix = float(contained_margin_deg) * 60.0 / RESO_ARCMIN
+        radius_pix = float(theta_crit_deg) * 60.0 / RESO_ARCMIN
+        low = radius_pix + contained_margin_pix
+        high = float(npix - 1) - low
+        if low > high:
+            raise RuntimeError(
+                "Contained geometry is not feasible for the current patch size and target radius. "
+                "Increase the patch size or switch to --geometry-mode=truncated."
+            )
     center_x_pix = rng.uniform(low, high)
     center_y_pix = rng.uniform(low, high)
     return center_x_pix, center_y_pix
 
 
-def make_preview_grid(indices, patches, labels, metadata, output_path):
+def fwhm_arcmin_to_sigma_pixels(fwhm_arcmin):
+    if fwhm_arcmin <= 0.0:
+        return 0.0
+    return float(fwhm_arcmin) / (2.0 * np.sqrt(2.0 * np.log(2.0)) * RESO_ARCMIN)
+
+
+def noise_sigma_k_per_pixel(noise_sigma_uk_arcmin):
+    if noise_sigma_uk_arcmin <= 0.0:
+        return 0.0
+    return float(noise_sigma_uk_arcmin) / RESO_ARCMIN * 1e-6
+
+
+def draw_patch_noise(rng, shape, noise_sigma_uk_arcmin, noise_corr_fwhm_arcmin):
+    sigma_k = noise_sigma_k_per_pixel(noise_sigma_uk_arcmin)
+    if sigma_k <= 0.0:
+        return np.zeros(shape, dtype=np.float32)
+
+    noise = rng.normal(loc=0.0, scale=sigma_k, size=shape).astype(np.float32)
+    corr_sigma_pix = fwhm_arcmin_to_sigma_pixels(noise_corr_fwhm_arcmin)
+    if corr_sigma_pix > 0.0:
+        noise = gaussian_filter(noise, sigma=corr_sigma_pix, mode="reflect")
+        std = float(np.std(noise))
+        if std > 0.0:
+            noise = noise * (sigma_k / std)
+    return noise.astype(np.float32)
+
+
+def apply_observing_model_to_patch(
+    patch,
+    rng,
+    beam_fwhm_arcmin,
+    noise_sigma_uk_arcmin,
+    noise_corr_fwhm_arcmin,
+):
+    observed = np.asarray(patch, dtype=np.float32)
+    beam_sigma_pix = fwhm_arcmin_to_sigma_pixels(beam_fwhm_arcmin)
+    if beam_sigma_pix > 0.0:
+        observed = gaussian_filter(observed, sigma=beam_sigma_pix, mode="reflect")
+    observed = observed + draw_patch_noise(
+        rng=rng,
+        shape=observed.shape,
+        noise_sigma_uk_arcmin=noise_sigma_uk_arcmin,
+        noise_corr_fwhm_arcmin=noise_corr_fwhm_arcmin,
+    )
+    return observed.astype(np.float32)
+
+
+def make_preview_grid(indices, patches, labels, metadata, truth, output_path):
     if len(indices) == 0:
         return
 
@@ -301,14 +422,18 @@ def make_preview_grid(indices, patches, labels, metadata, output_path):
         label = "pos" if labels[idx] == 1 else "neg"
         glon = metadata["glon_deg"][idx]
         glat = metadata["glat_deg"][idx]
+        split_name = "train" if metadata["split_tag"][idx] == SPLIT_TRAIN else "val"
         if labels[idx] == 1:
-            theta_crit = metadata["theta_crit_deg"][idx]
-            dx_deg = metadata["signal_center_dx_deg"][idx]
-            dy_deg = metadata["signal_center_dy_deg"][idx]
-            ax.set_title(f"{label}  lon={glon:.1f}, lat={glat:.1f}\nR={theta_crit:.1f} deg", fontsize=10)
+            theta_crit = truth["theta_crit_deg"][idx]
+            dx_deg = truth["signal_center_dx_deg"][idx]
+            dy_deg = truth["signal_center_dy_deg"][idx]
+            ax.set_title(
+                f"{label}/{split_name} lon={glon:.1f}, lat={glat:.1f}\nR={theta_crit:.1f} deg",
+                fontsize=10,
+            )
             ax.set_xlabel(f"dx={dx_deg:.1f} deg, dy={dy_deg:.1f} deg", fontsize=9)
         else:
-            ax.set_title(f"{label}  lon={glon:.1f}, lat={glat:.1f}", fontsize=10)
+            ax.set_title(f"{label}/{split_name} lon={glon:.1f}, lat={glat:.1f}", fontsize=10)
         ax.set_xticks([])
         ax.set_yticks([])
 
@@ -321,7 +446,7 @@ def make_preview_grid(indices, patches, labels, metadata, output_path):
     plt.close(fig)
 
 
-def make_positive_preview(indices, patches, masks, metadata, output_path):
+def make_positive_preview(indices, patches, masks, metadata, truth, output_path):
     if len(indices) == 0:
         return
 
@@ -336,12 +461,13 @@ def make_positive_preview(indices, patches, masks, metadata, output_path):
         patch_ax.imshow(patches[idx], cmap="RdBu_r", origin="lower")
         patch_ax.set_title(
             "Patch\n"
+            f"split={'train' if metadata['split_tag'][idx] == SPLIT_TRAIN else 'val'} "
             f"lon={metadata['glon_deg'][idx]:.1f}, lat={metadata['glat_deg'][idx]:.1f}\n"
-            f"R={metadata['theta_crit_deg'][idx]:.1f} deg, "
-            f"z0={metadata['z0'][idx]:.2e}, zcrit={metadata['zcrit'][idx]:.2e}, "
-            f"sigma={metadata['edge_sigma_deg'][idx]:.2f}\n"
-            f"dx={metadata['signal_center_dx_deg'][idx]:.1f} deg, "
-            f"dy={metadata['signal_center_dy_deg'][idx]:.1f} deg",
+            f"R={truth['theta_crit_deg'][idx]:.1f} deg, "
+            f"z0={truth['z0'][idx]:.2e}, zcrit={truth['zcrit'][idx]:.2e}, "
+            f"sigma={truth['edge_sigma_deg'][idx]:.2f}\n"
+            f"dx={truth['signal_center_dx_deg'][idx]:.1f} deg, "
+            f"dy={truth['signal_center_dy_deg'][idx]:.1f} deg",
             fontsize=10,
         )
         patch_ax.set_xticks([])
@@ -350,18 +476,16 @@ def make_positive_preview(indices, patches, masks, metadata, output_path):
         theta_grid = make_angular_distance_grid(
             PATCH_PIX,
             RESO_ARCMIN,
-            center_x_pix=float(metadata["signal_center_x_pix"][idx]),
-            center_y_pix=float(metadata["signal_center_y_pix"][idx]),
+            center_x_pix=float(truth["signal_center_x_pix"][idx]),
+            center_y_pix=float(truth["signal_center_y_pix"][idx]),
         )
-        signal = bubble_collision_signal(
-            theta_grid,
-            float(metadata["z0"][idx]),
-            float(metadata["zcrit"][idx]),
-            np.radians(float(metadata["theta_crit_deg"][idx])),
-            edge_sigma_deg=float(metadata["edge_sigma_deg"][idx]),
+        signal = np.where(
+            theta_grid <= np.radians(float(truth["theta_crit_deg"][idx])),
+            1.0,
+            0.0,
         )
-        signal_ax.imshow(signal, cmap="RdBu_r", origin="lower")
-        signal_ax.set_title("Injected signal template", fontsize=10)
+        signal_ax.imshow(signal, cmap="gray", origin="lower", vmin=0.0, vmax=1.0)
+        signal_ax.set_title("Causal disc support", fontsize=10)
         signal_ax.set_xticks([])
         signal_ax.set_yticks([])
 
@@ -370,15 +494,15 @@ def make_positive_preview(indices, patches, masks, metadata, output_path):
         mask_ax.set_xticks([])
         mask_ax.set_yticks([])
 
-    fig.suptitle("Positive patches, injected templates, and masks", fontsize=14)
+    fig.suptitle("Positive patches and target masks", fontsize=14)
     plt.tight_layout()
     plt.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
 
-def make_validation_histograms(labels, metadata, output_path):
+def make_validation_histograms(labels, metadata, truth, output_path):
     pos = labels == 1
-    fig, axes = plt.subplots(2, 4, figsize=(18, 9))
+    fig, axes = plt.subplots(2, 5, figsize=(21, 8.8))
     axes = axes.ravel()
 
     axes[0].hist(metadata["glon_deg"], bins=30, color="#2563eb", alpha=0.85)
@@ -387,23 +511,30 @@ def make_validation_histograms(labels, metadata, output_path):
     axes[1].hist(metadata["glat_deg"], bins=30, color="#0891b2", alpha=0.85)
     axes[1].set_title("Galactic latitude")
 
-    axes[2].hist(metadata["theta_crit_deg"][pos], bins=30, color="#7c3aed", alpha=0.85)
-    axes[2].set_title(r"$\theta_{\rm crit}$")
+    axes[2].hist(metadata["coord_mask_fraction"], bins=30, color="#0f766e", alpha=0.85)
+    axes[2].set_title("Projected mask fraction")
 
-    axes[3].hist(metadata["z0"][pos], bins=30, color="#dc2626", alpha=0.85)
-    axes[3].set_title(r"$z_0$")
+    axes[3].hist(truth["theta_crit_deg"][pos], bins=30, color="#7c3aed", alpha=0.85)
+    axes[3].set_title(r"$\theta_{\rm crit}$")
 
-    axes[4].hist(metadata["zcrit"][pos], bins=30, color="#ea580c", alpha=0.85)
-    axes[4].set_title(r"$z_{\rm crit}$")
+    axes[4].hist(truth["z0"][pos], bins=30, color="#dc2626", alpha=0.85)
+    axes[4].set_title(r"$z_0$")
 
-    axes[5].hist(metadata["edge_sigma_deg"][pos], bins=30, color="#16a34a", alpha=0.85)
-    axes[5].set_title("Edge sigma (deg)")
+    axes[5].hist(truth["zcrit"][pos], bins=30, color="#ea580c", alpha=0.85)
+    axes[5].set_title(r"$z_{\rm crit}$")
 
-    axes[6].hist(metadata["signal_center_dx_deg"][pos], bins=30, color="#0f766e", alpha=0.85)
-    axes[6].set_title("Signal center dx (deg)")
+    axes[6].hist(truth["edge_sigma_deg"][pos], bins=30, color="#16a34a", alpha=0.85)
+    axes[6].set_title("Edge sigma (deg)")
 
-    axes[7].hist(metadata["signal_center_dy_deg"][pos], bins=30, color="#7c2d12", alpha=0.85)
-    axes[7].set_title("Signal center dy (deg)")
+    axes[7].hist(truth["signal_center_dx_deg"][pos], bins=30, color="#7c2d12", alpha=0.85)
+    axes[7].set_title("Signal center dx (deg)")
+
+    axes[8].hist(truth["signal_center_dy_deg"][pos], bins=30, color="#1d4ed8", alpha=0.85)
+    axes[8].set_title("Signal center dy (deg)")
+
+    axes[9].hist(truth["target_touches_edge"][pos], bins=np.array([-0.5, 0.5, 1.5]), color="#111827", alpha=0.85)
+    axes[9].set_title("Target touches edge")
+    axes[9].set_xticks([0, 1])
 
     for ax in axes:
         ax.grid(alpha=0.25)
@@ -414,7 +545,19 @@ def make_validation_histograms(labels, metadata, output_path):
     plt.close(fig)
 
 
-def save_outputs(output_dir, patches, labels, masks, metadata, summary, preview_count, rng):
+def save_outputs(
+    output_dir,
+    patches,
+    labels,
+    masks,
+    metadata,
+    truth,
+    summary,
+    preview_count,
+    rng,
+    split_payload,
+    coordinate_pool_payload,
+):
     os.makedirs(output_dir, exist_ok=True)
 
     h5_path = os.path.join(output_dir, "training_data.h5")
@@ -432,30 +575,34 @@ def save_outputs(output_dir, patches, labels, masks, metadata, summary, preview_
         for key, value in metadata.items():
             metadata_group.create_dataset(key, data=value, compression="gzip", shuffle=True)
 
+        truth_group = h5.create_group("truth")
+        for key, value in truth.items():
+            truth_group.create_dataset(key, data=value, compression="gzip", shuffle=True)
+
+        splits_group = h5.create_group("splits")
+        for key, value in split_payload.items():
+            splits_group.create_dataset(key, data=value, compression="gzip", shuffle=True)
+
+        coord_group = h5.create_group("coordinate_pool")
+        for key, value in coordinate_pool_payload.items():
+            coord_group.create_dataset(key, data=value, compression="gzip", shuffle=True)
+
         summary_group = h5.create_group("summary")
         for key, value in summary.items():
             summary_group.attrs[key] = value
 
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
 
     sample_preview_count = min(preview_count, len(labels))
     sample_indices = rng.choice(len(labels), size=sample_preview_count, replace=False)
-    make_preview_grid(sample_indices, patches, labels, metadata, preview_samples_path)
+    make_preview_grid(sample_indices, patches, labels, metadata, truth, preview_samples_path)
 
     positive_indices = np.flatnonzero(labels == 1)
     positive_preview_count = min(preview_count, len(positive_indices))
-    positive_preview_indices = rng.choice(
-        positive_indices, size=positive_preview_count, replace=False
-    )
-    make_positive_preview(
-        positive_preview_indices,
-        patches,
-        masks,
-        metadata,
-        preview_positives_path,
-    )
-    make_validation_histograms(labels, metadata, validation_hist_path)
+    positive_preview_indices = rng.choice(positive_indices, size=positive_preview_count, replace=False)
+    make_positive_preview(positive_preview_indices, patches, masks, metadata, truth, preview_positives_path)
+    make_validation_histograms(labels, metadata, truth, validation_hist_path)
 
     print("\n=== Saved outputs ===")
     print(f"  {h5_path}")
@@ -463,146 +610,250 @@ def save_outputs(output_dir, patches, labels, masks, metadata, summary, preview_
     print(f"  {preview_samples_path}")
     print(f"  {preview_positives_path}")
     print(f"  {validation_hist_path}")
+    return h5_path
+
+
+def split_class_counts(total_count, train_fraction):
+    train_count = int(round(total_count * train_fraction))
+    train_count = min(max(train_count, 1), total_count - 1)
+    val_count = total_count - train_count
+    return train_count, val_count
 
 
 def main():
     args = parse_args()
     ensure_even_sample_count(args.num_samples)
-    validate_smoothing_args(args)
+    validate_args(args)
+
+    if not args.skip_physics_checks:
+        print("\n=== Running pre-generation physics checks ===")
+        check_eq1_special_cases()
+        check_smooth_window_bounds()
+        check_multiplicative_injection()
+        check_patch_geometry()
+        print("  Physics checks: pass")
 
     rng = np.random.default_rng(args.seed)
     mask_256, sky_fraction = load_mask()
-    coord_pool = build_coordinate_pool(mask_256, args.pool_size, rng)
+    coord_pool, coord_mask_fractions = build_coordinate_pool(mask_256, args.pool_size, rng)
+    coord_train_idx, coord_val_idx = split_index_pool(len(coord_pool), args.train_fraction, args.split_seed)
     cmb_realizations, camb_params = generate_camb_realizations(args.num_cmb_realizations, rng)
-
-    contained_radius_deg = max_fully_contained_radius_deg()
-    requested_max_radius_deg = 25.0
-    if requested_max_radius_deg > contained_radius_deg:
-        print(
-            "\n=== Geometry warning ===\n"
-            f"  The current patch geometry fully contains centered disks only up to about "
-            f"{contained_radius_deg:.2f} deg.\n"
-            f"  Requested injections extend to {requested_max_radius_deg:.1f} deg.\n"
-            "  Positive injections are now randomized within the patch, so partial disks "
-            "near the patch boundaries are expected by design."
-        )
+    realization_train_idx, realization_val_idx = split_index_pool(
+        len(cmb_realizations), args.train_fraction, args.split_seed + 1
+    )
 
     num_samples = args.num_samples
     num_positive = num_samples // 2
     num_negative = num_samples - num_positive
+    train_positive, val_positive = split_class_counts(num_positive, args.train_fraction)
+    train_negative, val_negative = split_class_counts(num_negative, args.train_fraction)
+    train_samples = train_positive + train_negative
+    val_samples = val_positive + val_negative
 
-    print("\n=== Generating samples ===")
+    print("\n=== Split design ===")
+    print(f"  Train samples:       {train_samples} ({train_positive} pos / {train_negative} neg)")
+    print(f"  Val samples:         {val_samples} ({val_positive} pos / {val_negative} neg)")
+    print(f"  Train coordinates:   {len(coord_train_idx)}")
+    print(f"  Val coordinates:     {len(coord_val_idx)}")
+    print(f"  Train realizations:  {len(realization_train_idx)}")
+    print(f"  Val realizations:    {len(realization_val_idx)}")
+
     patches = np.empty((num_samples, PATCH_PIX, PATCH_PIX), dtype=np.float32)
     labels = np.zeros(num_samples, dtype=np.uint8)
     masks = np.zeros((num_samples, PATCH_PIX, PATCH_PIX), dtype=np.uint8)
 
-    glon_deg = np.empty(num_samples, dtype=np.float32)
-    glat_deg = np.empty(num_samples, dtype=np.float32)
-    cmb_realization_idx = np.full(num_samples, -1, dtype=np.int32)
-    theta_crit_deg = np.full(num_samples, np.nan, dtype=np.float32)
-    z0 = np.full(num_samples, np.nan, dtype=np.float32)
-    zcrit = np.full(num_samples, np.nan, dtype=np.float32)
-    edge_sigma_deg = np.full(num_samples, np.nan, dtype=np.float32)
-    signal_center_x_pix = np.full(num_samples, np.nan, dtype=np.float32)
-    signal_center_y_pix = np.full(num_samples, np.nan, dtype=np.float32)
-    signal_center_dx_deg = np.full(num_samples, np.nan, dtype=np.float32)
-    signal_center_dy_deg = np.full(num_samples, np.nan, dtype=np.float32)
-
-    positive_flags = np.zeros(num_samples, dtype=bool)
-    positive_flags[:num_positive] = True
-    rng.shuffle(positive_flags)
-    sign_pairs = build_balanced_sign_pairs(num_positive, rng)
-    positive_counter = 0
-
-    for idx in range(num_samples):
-        coord_idx = rng.integers(0, len(coord_pool))
-        lon_i, lat_i = coord_pool[coord_idx]
-        realization_idx_i = int(rng.integers(0, len(cmb_realizations)))
-        clean_patch = np.asarray(
-            project_patch(cmb_realizations[realization_idx_i], float(lon_i), float(lat_i)),
-            dtype=np.float32,
-        )
-
-        glon_deg[idx] = lon_i
-        glat_deg[idx] = lat_i
-        cmb_realization_idx[idx] = realization_idx_i
-
-        if positive_flags[idx]:
-            label = 1
-            theta_i = sample_theta_crit_from_sin_prior(rng, 5.0, 25.0)
-            sign_z0_i, sign_zcrit_i = sign_pairs[positive_counter]
-            z0_i = sign_z0_i * sample_log_uniform(rng, 1e-6, 1e-4)
-            zcrit_i = sign_zcrit_i * sample_log_uniform(rng, 1e-6, 1e-4)
-            edge_sigma_i = rng.uniform(args.edge_sigma_min_deg, args.edge_sigma_max_deg)
-            center_x_i, center_y_i = sample_signal_center_pixels(
-                rng,
-                PATCH_PIX,
-                edge_margin_pix=args.signal_center_edge_margin_pix,
-            )
-            center_pix = (PATCH_PIX - 1) / 2.0
-            center_dx_i = (center_x_i - center_pix) * RESO_ARCMIN / 60.0
-            center_dy_i = (center_y_i - center_pix) * RESO_ARCMIN / 60.0
-
-            patch_i, _ = inject_signal_into_patch(
-                clean_patch,
-                z0_i,
-                zcrit_i,
-                theta_i,
-                edge_sigma_deg=edge_sigma_i,
-                center_x_pix=center_x_i,
-                center_y_pix=center_y_i,
-            )
-            theta_grid_i = make_angular_distance_grid(
-                PATCH_PIX,
-                RESO_ARCMIN,
-                center_x_pix=center_x_i,
-                center_y_pix=center_y_i,
-            )
-            mask_i = make_disk_mask(theta_grid_i, theta_i)
-
-            patches[idx] = np.asarray(patch_i, dtype=np.float32)
-            labels[idx] = label
-            masks[idx] = mask_i
-            theta_crit_deg[idx] = theta_i
-            z0[idx] = z0_i
-            zcrit[idx] = zcrit_i
-            edge_sigma_deg[idx] = edge_sigma_i
-            signal_center_x_pix[idx] = center_x_i
-            signal_center_y_pix[idx] = center_y_i
-            signal_center_dx_deg[idx] = center_dx_i
-            signal_center_dy_deg[idx] = center_dy_i
-            positive_counter += 1
-        else:
-            patches[idx] = clean_patch
-
-        if (idx + 1) % 50 == 0 or idx + 1 == num_samples:
-            positives_so_far = int(labels[:idx + 1].sum())
-            print(
-                f"  Generated {idx + 1:4d} / {num_samples} samples "
-                f"(positives so far: {positives_so_far})"
-            )
-
     metadata = {
-        "glon_deg": glon_deg,
-        "glat_deg": glat_deg,
-        "cmb_realization_idx": cmb_realization_idx,
-        "theta_crit_deg": theta_crit_deg,
-        "z0": z0,
-        "zcrit": zcrit,
-        "edge_sigma_deg": edge_sigma_deg,
-        "signal_center_x_pix": signal_center_x_pix,
-        "signal_center_y_pix": signal_center_y_pix,
-        "signal_center_dx_deg": signal_center_dx_deg,
-        "signal_center_dy_deg": signal_center_dy_deg,
-        "is_positive": labels.astype(np.uint8),
+        "sample_index": np.arange(num_samples, dtype=np.int32),
+        "split_tag": np.zeros(num_samples, dtype=np.uint8),
+        "glon_deg": np.empty(num_samples, dtype=np.float32),
+        "glat_deg": np.empty(num_samples, dtype=np.float32),
+        "coord_pool_idx": np.empty(num_samples, dtype=np.int32),
+        "coord_mask_fraction": np.empty(num_samples, dtype=np.float32),
+        "cmb_realization_idx": np.empty(num_samples, dtype=np.int32),
+        "background_id": np.zeros(num_samples, dtype=np.uint64),
+        "split_group_id": np.zeros(num_samples, dtype=np.uint64),
     }
+    truth = {
+        "has_signal": np.zeros(num_samples, dtype=np.uint8),
+        "event_id": np.zeros(num_samples, dtype=np.uint64),
+        "theta_crit_deg": np.zeros(num_samples, dtype=np.float32),
+        "z0": np.zeros(num_samples, dtype=np.float32),
+        "zcrit": np.zeros(num_samples, dtype=np.float32),
+        "edge_sigma_deg": np.zeros(num_samples, dtype=np.float32),
+        "signal_center_x_pix": np.full(num_samples, patch_center_pixel(PATCH_PIX), dtype=np.float32),
+        "signal_center_y_pix": np.full(num_samples, patch_center_pixel(PATCH_PIX), dtype=np.float32),
+        "signal_center_dx_deg": np.zeros(num_samples, dtype=np.float32),
+        "signal_center_dy_deg": np.zeros(num_samples, dtype=np.float32),
+        "geometry_mode_code": np.zeros(num_samples, dtype=np.uint8),
+        "fully_contained": np.zeros(num_samples, dtype=np.uint8),
+        "target_touches_edge": np.zeros(num_samples, dtype=np.uint8),
+    }
+
+    train_idx = np.arange(train_samples, dtype=np.int64)
+    val_idx = np.arange(train_samples, num_samples, dtype=np.int64)
+
+    split_specs = [
+        {
+            "name": "train",
+            "sample_indices": train_idx,
+            "split_tag": SPLIT_TRAIN,
+            "num_positive": train_positive,
+            "coord_indices": coord_train_idx,
+            "realization_indices": realization_train_idx,
+            "seed_offset": 1000,
+        },
+        {
+            "name": "val",
+            "sample_indices": val_idx,
+            "split_tag": SPLIT_VAL,
+            "num_positive": val_positive,
+            "coord_indices": coord_val_idx,
+            "realization_indices": realization_val_idx,
+            "seed_offset": 2000,
+        },
+    ]
+
+    for split_spec in split_specs:
+        split_rng = np.random.default_rng(args.seed + split_spec["seed_offset"])
+        sample_indices = split_spec["sample_indices"]
+        positive_flags = np.zeros(len(sample_indices), dtype=bool)
+        positive_flags[: split_spec["num_positive"]] = True
+        split_rng.shuffle(positive_flags)
+        sign_pairs = build_balanced_sign_pairs(split_spec["num_positive"], split_rng)
+        positive_counter = 0
+
+        for local_offset, sample_idx in enumerate(sample_indices):
+            coord_idx = int(split_rng.choice(split_spec["coord_indices"]))
+            realization_idx = int(split_rng.choice(split_spec["realization_indices"]))
+            lon_i, lat_i = coord_pool[coord_idx]
+            mask_fraction_i = float(coord_mask_fractions[coord_idx])
+
+            clean_patch = np.asarray(
+                project_patch(cmb_realizations[realization_idx], float(lon_i), float(lat_i)),
+                dtype=np.float32,
+            )
+
+            metadata["split_tag"][sample_idx] = split_spec["split_tag"]
+            metadata["glon_deg"][sample_idx] = lon_i
+            metadata["glat_deg"][sample_idx] = lat_i
+            metadata["coord_pool_idx"][sample_idx] = coord_idx
+            metadata["coord_mask_fraction"][sample_idx] = mask_fraction_i
+            metadata["cmb_realization_idx"][sample_idx] = realization_idx
+
+            background_id = stable_group_id("camb", realization_idx, coord_idx)
+            metadata["background_id"][sample_idx] = np.uint64(background_id)
+            metadata["split_group_id"][sample_idx] = np.uint64(background_id)
+
+            if positive_flags[local_offset]:
+                theta_i = sample_theta_crit_from_training_prior(split_rng, 5.0, 25.0)
+                sign_z0_i, sign_zcrit_i = sign_pairs[positive_counter]
+                z0_i = sign_z0_i * sample_log_uniform(split_rng, 1e-6, 1e-4)
+                zcrit_i = sign_zcrit_i * sample_log_uniform(split_rng, 1e-6, 1e-4)
+                edge_sigma_i = split_rng.uniform(args.edge_sigma_min_deg, args.edge_sigma_max_deg)
+                center_x_i, center_y_i = sample_signal_center_pixels(
+                    rng=split_rng,
+                    npix=PATCH_PIX,
+                    theta_crit_deg=theta_i,
+                    geometry_mode=args.geometry_mode,
+                    edge_margin_pix=args.signal_center_edge_margin_pix,
+                    contained_margin_deg=args.contained_margin_deg,
+                )
+                center_pix = patch_center_pixel(PATCH_PIX)
+                center_dx_i = (center_x_i - center_pix) * RESO_ARCMIN / 60.0
+                center_dy_i = (center_y_i - center_pix) * RESO_ARCMIN / 60.0
+
+                injected_patch, _ = inject_signal_into_patch(
+                    clean_patch,
+                    z0_i,
+                    zcrit_i,
+                    theta_i,
+                    edge_sigma_deg=edge_sigma_i,
+                    center_x_pix=center_x_i,
+                    center_y_pix=center_y_i,
+                )
+                theta_grid_i = make_angular_distance_grid(
+                    PATCH_PIX,
+                    RESO_ARCMIN,
+                    center_x_pix=center_x_i,
+                    center_y_pix=center_y_i,
+                )
+                mask_i = make_disk_mask(theta_grid_i, theta_i)
+                touches_edge = target_touches_patch_edge(mask_i)
+                fully_contained = int(not touches_edge)
+                if args.geometry_mode == "contained" and touches_edge:
+                    raise RuntimeError("Contained geometry produced a target that touches the patch edge.")
+
+                observed_patch = apply_observing_model_to_patch(
+                    injected_patch,
+                    rng=split_rng,
+                    beam_fwhm_arcmin=args.beam_fwhm_arcmin,
+                    noise_sigma_uk_arcmin=args.noise_sigma_uk_arcmin,
+                    noise_corr_fwhm_arcmin=args.noise_corr_fwhm_arcmin,
+                )
+
+                event_id = stable_group_id(
+                    background_id,
+                    f"{theta_i:.6f}",
+                    f"{z0_i:.6e}",
+                    f"{zcrit_i:.6e}",
+                    f"{edge_sigma_i:.6f}",
+                    f"{center_x_i:.6f}",
+                    f"{center_y_i:.6f}",
+                )
+
+                patches[sample_idx] = observed_patch
+                labels[sample_idx] = 1
+                masks[sample_idx] = mask_i
+                truth["has_signal"][sample_idx] = 1
+                truth["event_id"][sample_idx] = np.uint64(event_id)
+                truth["theta_crit_deg"][sample_idx] = theta_i
+                truth["z0"][sample_idx] = z0_i
+                truth["zcrit"][sample_idx] = zcrit_i
+                truth["edge_sigma_deg"][sample_idx] = edge_sigma_i
+                truth["signal_center_x_pix"][sample_idx] = center_x_i
+                truth["signal_center_y_pix"][sample_idx] = center_y_i
+                truth["signal_center_dx_deg"][sample_idx] = center_dx_i
+                truth["signal_center_dy_deg"][sample_idx] = center_dy_i
+                truth["geometry_mode_code"][sample_idx] = 0 if args.geometry_mode == "contained" else 1
+                truth["fully_contained"][sample_idx] = fully_contained
+                truth["target_touches_edge"][sample_idx] = int(touches_edge)
+                positive_counter += 1
+            else:
+                observed_patch = apply_observing_model_to_patch(
+                    clean_patch,
+                    rng=split_rng,
+                    beam_fwhm_arcmin=args.beam_fwhm_arcmin,
+                    noise_sigma_uk_arcmin=args.noise_sigma_uk_arcmin,
+                    noise_corr_fwhm_arcmin=args.noise_corr_fwhm_arcmin,
+                )
+                patches[sample_idx] = observed_patch
+
+            if (local_offset + 1) % 50 == 0 or (local_offset + 1) == len(sample_indices):
+                positives_so_far = int(labels[sample_indices[: local_offset + 1]].sum())
+                print(
+                    f"  {split_spec['name']}: generated {local_offset + 1:4d} / {len(sample_indices)} "
+                    f"samples (positives so far: {positives_so_far})"
+                )
+
     summary = {
         "num_samples": int(num_samples),
         "num_positive": int(labels.sum()),
         "num_negative": int(num_samples - labels.sum()),
+        "num_train_samples": int(len(train_idx)),
+        "num_val_samples": int(len(val_idx)),
+        "num_train_positive": int(labels[train_idx].sum()),
+        "num_train_negative": int(len(train_idx) - labels[train_idx].sum()),
+        "num_val_positive": int(labels[val_idx].sum()),
+        "num_val_negative": int(len(val_idx) - labels[val_idx].sum()),
         "pool_size": int(len(coord_pool)),
+        "num_train_coordinates": int(len(coord_train_idx)),
+        "num_val_coordinates": int(len(coord_val_idx)),
         "num_cmb_realizations": int(args.num_cmb_realizations),
+        "num_train_realizations": int(len(realization_train_idx)),
+        "num_val_realizations": int(len(realization_val_idx)),
         "seed": int(args.seed),
+        "split_seed": int(args.split_seed),
+        "train_fraction": float(args.train_fraction),
         "preview_count": int(args.preview_count),
         "nside": int(NSIDE_WORKING),
         "patch_pixels": int(PATCH_PIX),
@@ -610,32 +861,71 @@ def main():
         "mask_threshold": float(MASK_THRESHOLD),
         "edge_sigma_min_deg": float(args.edge_sigma_min_deg),
         "edge_sigma_max_deg": float(args.edge_sigma_max_deg),
+        "geometry_mode": args.geometry_mode,
+        "contained_margin_deg": float(args.contained_margin_deg),
         "signal_center_edge_margin_pix": float(args.signal_center_edge_margin_pix),
         "sky_fraction": float(sky_fraction),
-        "theta_prior": "sin(theta_crit)",
+        "theta_training_distribution": "sin(theta_crit)",
+        "theta_distribution_note": "Eq. 2-motivated training design choice; not the downstream inference prior.",
         "z0_sign_sampling": "balanced",
         "zcrit_sign_sampling": "balanced",
-        "positive_injection_geometry": "randomized within patch",
+        "split_method": "coordinate_and_realization_disjoint",
+        "beam_fwhm_arcmin": float(args.beam_fwhm_arcmin),
+        "noise_sigma_uk_arcmin": float(args.noise_sigma_uk_arcmin),
+        "noise_corr_fwhm_arcmin": float(args.noise_corr_fwhm_arcmin),
         "camb_params": json.dumps(camb_params, sort_keys=True),
         "output_dir": os.path.abspath(args.output_dir),
         "dataset_path": os.path.abspath(os.path.join(args.output_dir, "training_data.h5")),
         "created_utc": dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
     }
 
+    split_payload = {
+        "train_idx": train_idx.astype(np.int64),
+        "val_idx": val_idx.astype(np.int64),
+        "coord_train_idx": coord_train_idx.astype(np.int32),
+        "coord_val_idx": coord_val_idx.astype(np.int32),
+        "realization_train_idx": realization_train_idx.astype(np.int32),
+        "realization_val_idx": realization_val_idx.astype(np.int32),
+    }
+    coordinate_pool_payload = {
+        "glon_deg": coord_pool[:, 0].astype(np.float32),
+        "glat_deg": coord_pool[:, 1].astype(np.float32),
+        "mask_fraction": coord_mask_fractions.astype(np.float32),
+    }
+
     print("\n=== Final class counts ===")
     print(f"  Positive: {summary['num_positive']}")
     print(f"  Negative: {summary['num_negative']}")
-
-    save_outputs(
-        args.output_dir,
-        patches,
-        labels,
-        masks,
-        metadata,
-        summary,
-        args.preview_count,
-        rng,
+    print(f"  Geometry mode: {args.geometry_mode}")
+    print(
+        f"  Positive targets touching edge: "
+        f"{int(truth['target_touches_edge'][labels == 1].sum())} / {int(labels.sum())}"
     )
+
+    h5_path = save_outputs(
+        output_dir=args.output_dir,
+        patches=patches,
+        labels=labels,
+        masks=masks,
+        metadata=metadata,
+        truth=truth,
+        summary=summary,
+        preview_count=args.preview_count,
+        rng=rng,
+        split_payload=split_payload,
+        coordinate_pool_payload=coordinate_pool_payload,
+    )
+
+    if not args.skip_post_audit:
+        print("\n=== Running post-generation audit ===")
+        audit_report = run_audit(h5_path, allow_legacy=False, sample_patch_count=0)
+        audit_path = os.path.join(args.output_dir, "audit_report.json")
+        with open(audit_path, "w", encoding="utf-8") as handle:
+            json.dump(audit_report, handle, indent=2)
+        print(f"  Audit status: {audit_report['status']}")
+        print(f"  Audit report: {audit_path}")
+        if audit_report["status"] != "pass":
+            raise RuntimeError(f"Generated dataset failed audit. See {audit_path}")
 
 
 if __name__ == "__main__":
